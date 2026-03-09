@@ -57,14 +57,26 @@ bool isScrolling = false;
 int touchStartX = 0;
 int touchStartY = 0;
 
+// 第二页滚动相关
+int page2ScrollY = 0;
+bool isPage2Scrolling = false;
+int page2TouchStartY = 0;
+#define PAGE2_CONTENT_HEIGHT 280  // 第二页内容总高度
+#define PAGE2_VISIBLE_HEIGHT (SCREEN_HEIGHT - TASKBAR_HEIGHT)  // 可见区域高度
+
 // 网络服务器
 WebServer server(80);
 
 // 系统数据
-String systemFps = "0 FPS";
-String systemCpu = "CPU: 0%";
-String systemGpu = "GPU: 0%";
-String systemMem = "内存: 0%";
+String systemFps = "0";
+
+// 第二页的4个数据项
+String page2Data[4] = {"0%", "GPU: 0%\nGPU Fan: 0 RPM", "0%", "None"};
+
+// 第三页网络信息
+String networkName = "Unknown";
+String pcIP = "0.0.0.0";
+String wifiDevices = "0";
 
 // 卡片数据结构
 struct CardData {
@@ -77,10 +89,10 @@ struct CardData {
 void drawCards();
 
 CardData cards[CARD_COUNT] = {
-    {"FPS", "0 FPS", TFT_BLACK},
-    {"系统资源", "CPU: 0%\nGPU: 0%\n内存: 0%", TFT_BLACK},
-    {"IP地址", "", TFT_BLACK},
-    {"卡片4", "这是第四个卡片的内容", TFT_BLACK}
+    {"FPS", "0", TFT_BLACK},
+    {"System Info", "", TFT_BLACK},
+    {"Network", "", TFT_BLACK},
+    {"Card 4", "Content", TFT_BLACK}
 };
 
 // 显示连接状态提示
@@ -113,7 +125,7 @@ void showConnectionProgress(const char* step, int progress) {
 
 // 连接WiFi
 bool connectWiFi() {
-    showConnectionProgress("正在连接WiFi...", 10);
+    showConnectionProgress("Connecting WiFi...", 10);
     
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
@@ -124,16 +136,16 @@ bool connectWiFi() {
         attempts++;
         int progress = 10 + (attempts * 3);
         if (progress > 50) progress = 50;
-        showConnectionProgress("正在连接WiFi...", progress);
+        showConnectionProgress("Connecting WiFi...", progress);
     }
     
     if (WiFi.status() == WL_CONNECTED) {
         wifiConnected = true;
-        showConnectionProgress("WiFi已连接", 60);
+        showConnectionProgress("WiFi Connected", 60);
         delay(500);
         return true;
     } else {
-        showStatusMessage("WiFi连接失败", TFT_RED);
+        showStatusMessage("WiFi Failed", TFT_RED);
         delay(2000);
         return false;
     }
@@ -141,7 +153,7 @@ bool connectWiFi() {
 
 // 同步NTP时间
 bool syncNTPTime() {
-    showConnectionProgress("正在同步时间...", 70);
+    showConnectionProgress("Syncing Time...", 70);
     
     // 尝试多个国内NTP服务器
     const char* servers[] = {ntpServer1, ntpServer2, ntpServer3};
@@ -156,10 +168,10 @@ bool syncNTPTime() {
         
         int retry = 0;
         while (retry < 3) {
-            showConnectionProgress("正在同步时间...", 75 + retry * 5);
+            showConnectionProgress("Syncing Time...", 75 + retry * 5);
             if (timeClient->update()) {
                 ntpSynced = true;
-                showConnectionProgress("时间同步成功", 100);
+                showConnectionProgress("Time Synced", 100);
                 delay(500);
                 return true;
             }
@@ -168,7 +180,7 @@ bool syncNTPTime() {
         }
     }
     
-    showStatusMessage("时间同步失败", TFT_RED);
+    showStatusMessage("Time Sync Failed", TFT_RED);
     delay(2000);
     return false;
 }
@@ -179,21 +191,36 @@ void handleSystemData() {
         systemFps = server.arg("fps");
         cards[0].content = systemFps;
     }
-    if (server.hasArg("cpu")) {
-        systemCpu = "CPU: " + server.arg("cpu") + "%";
+    
+    // 处理第二页的4个数据项
+    if (server.hasArg("data1")) {
+        page2Data[0] = server.arg("data1");
     }
-    if (server.hasArg("gpu")) {
-        systemGpu = "GPU: " + server.arg("gpu") + "%";
+    if (server.hasArg("data2")) {
+        page2Data[1] = server.arg("data2");
     }
-    if (server.hasArg("mem")) {
-        systemMem = "内存: " + server.arg("mem") + "%";
+    if (server.hasArg("data3")) {
+        page2Data[2] = server.arg("data3");
     }
-    cards[1].content = systemCpu + "\n" + systemGpu + "\n" + systemMem;
+    if (server.hasArg("data4")) {
+        page2Data[3] = server.arg("data4");
+    }
+    
+    // 处理第三页网络信息
+    if (server.hasArg("network")) {
+        networkName = server.arg("network");
+    }
+    if (server.hasArg("pcip")) {
+        pcIP = server.arg("pcip");
+    }
+    if (server.hasArg("devices")) {
+        wifiDevices = server.arg("devices");
+    }
     
     server.send(200, "text/plain", "OK");
     
     // 重新绘制当前卡片
-    if (currentPage == 0 || currentPage == 1) {
+    if (currentPage == 0 || currentPage == 1 || currentPage == 2) {
         drawCards();
     }
 }
@@ -263,6 +290,119 @@ void drawRoundedRect(int x, int y, int width, int height, int radius, uint16_t c
     tft.fillRoundRect(x, y, width, height, radius, color);
 }
 
+// 绘制第二页的4个卡片（支持滚动）
+void drawPage2() {
+    int cardHeight = 48;
+    int cardWidth = SCREEN_WIDTH - 2 * CARD_MARGIN;
+    int cardSpacing = 5;
+    int startY = TASKBAR_HEIGHT + 10 - page2ScrollY;  // 应用滚动偏移
+    
+    // 卡片标题（英文）
+    const char* cardTitles[4] = {"CPU", "GPU", "Memory", "Window"};
+    
+    for (int i = 0; i < 4; i++) {
+        int y = startY + i * (cardHeight + cardSpacing);
+        
+        // 只绘制在可见区域内的卡片
+        if (y + cardHeight < TASKBAR_HEIGHT || y > SCREEN_HEIGHT) {
+            continue;
+        }
+        
+        // 绘制卡片背景
+        tft.fillRoundRect(CARD_MARGIN, y, cardWidth, cardHeight, 5, TFT_DARKGREY);
+        
+        // 绘制卡片标题（靠左对齐）
+        tft.setTextColor(TFT_CYAN, TFT_DARKGREY);
+        tft.setTextSize(1);
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(cardTitles[i], CARD_MARGIN + 8, y + 5);
+        
+        // 绘制卡片内容（靠左对齐）
+        tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+        tft.setTextSize(2);
+        tft.setTextDatum(TL_DATUM);
+        
+        // 处理多行内容
+        if (i == 1) {
+            // GPU卡片：显示GPU和风扇信息
+            String gpuLine = page2Data[1].substring(0, page2Data[1].indexOf('\n'));
+            String fanLine = page2Data[1].substring(page2Data[1].indexOf('\n') + 1);
+            tft.drawString(gpuLine, CARD_MARGIN + 8, y + cardHeight - 25);
+            tft.setTextSize(1);
+            tft.drawString(fanLine, CARD_MARGIN + 8, y + cardHeight - 10);
+        } else if (i == 3) {
+            // Window卡片：2行显示，确保不超出屏幕
+            String windowText = page2Data[3];
+            int textLen = windowText.length();
+            int maxCharsPerLine = 14; // 每行最多字符数（根据屏幕宽度调整）
+            
+            if (textLen <= maxCharsPerLine) {
+                // 短文本，单行显示
+                tft.drawString(windowText, CARD_MARGIN + 8, y + cardHeight - 18);
+            } else {
+                // 长文本，分两行显示
+                String line1 = windowText.substring(0, maxCharsPerLine);
+                String line2 = windowText.substring(maxCharsPerLine);
+                
+                // 如果第二行太长，截断并添加省略号
+                if (line2.length() > maxCharsPerLine) {
+                    line2 = line2.substring(0, maxCharsPerLine - 3) + "...";
+                }
+                
+                tft.setTextSize(1);
+                tft.drawString(line1, CARD_MARGIN + 8, y + cardHeight - 25);
+                tft.drawString(line2, CARD_MARGIN + 8, y + cardHeight - 12);
+            }
+        } else {
+            tft.drawString(page2Data[i], CARD_MARGIN + 8, y + cardHeight - 18);
+        }
+    }
+    
+    // 绘制滚动指示器
+    if (PAGE2_CONTENT_HEIGHT > PAGE2_VISIBLE_HEIGHT) {
+        int scrollbarHeight = (PAGE2_VISIBLE_HEIGHT * PAGE2_VISIBLE_HEIGHT) / PAGE2_CONTENT_HEIGHT;
+        int scrollbarY = TASKBAR_HEIGHT + (page2ScrollY * (PAGE2_VISIBLE_HEIGHT - scrollbarHeight)) / (PAGE2_CONTENT_HEIGHT - PAGE2_VISIBLE_HEIGHT);
+        tft.fillRect(SCREEN_WIDTH - 4, scrollbarY, 3, scrollbarHeight, TFT_LIGHTGREY);
+    }
+}
+
+// 绘制第三页网络信息
+void drawPage3() {
+    int cardHeight = 55;
+    int cardWidth = SCREEN_WIDTH - 2 * CARD_MARGIN;
+    int cardSpacing = 8;
+    int startY = TASKBAR_HEIGHT + 15;
+    
+    // 网络信息卡片数据
+    const char* titles[3] = {"Network Name", "PC IP Address", "WiFi Devices"};
+    String values[3] = {networkName, pcIP, wifiDevices};
+    
+    for (int i = 0; i < 3; i++) {
+        int y = startY + i * (cardHeight + cardSpacing);
+        
+        // 绘制卡片背景
+        tft.fillRoundRect(CARD_MARGIN, y, cardWidth, cardHeight, 5, TFT_DARKGREY);
+        
+        // 绘制卡片标题
+        tft.setTextColor(TFT_CYAN, TFT_DARKGREY);
+        tft.setTextSize(1);
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(titles[i], CARD_MARGIN + 8, y + 6);
+        
+        // 绘制卡片内容
+        tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+        tft.setTextSize(2);
+        tft.setTextDatum(TL_DATUM);
+        
+        // 截断文本以适应卡片宽度
+        String value = values[i];
+        if (value.length() > 16) {
+            value = value.substring(0, 13) + "...";
+        }
+        tft.drawString(value, CARD_MARGIN + 8, y + cardHeight - 20);
+    }
+}
+
 // 绘制单个卡片
 void drawCard(int cardIndex, int offsetX) {
     int cardWidth = SCREEN_WIDTH - 2 * CARD_MARGIN;
@@ -272,15 +412,32 @@ void drawCard(int cardIndex, int offsetX) {
     
     if (cardIndex == 0) {
         // FPS页面：全屏显示
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
         // 绘制标题
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setTextSize(2);
         tft.setTextDatum(TC_DATUM);
         tft.drawString(cards[cardIndex].title, SCREEN_WIDTH / 2 + offsetX, 50);
+        
+        // 根据FPS值设置颜色
+        int fps = cards[cardIndex].content.toInt();
+        if (fps < 30) {
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+        } else if (fps < 60) {
+            tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        } else {
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        }
+        
         // 绘制FPS数值，使用大字体
         tft.setTextSize(5); // 约50像素大小
         tft.setTextDatum(CC_DATUM);
         tft.drawString(cards[cardIndex].content, SCREEN_WIDTH / 2 + offsetX, SCREEN_HEIGHT / 2);
+    } else if (cardIndex == 1) {
+        // 第二页：显示4个元素（支持滚动）
+        drawPage2();
+    } else if (cardIndex == 2) {
+        // 第三页：显示网络信息
+        drawPage3();
     } else {
         // 其他页面：带任务栏
         // 绘制卡片标题
@@ -336,21 +493,47 @@ void handleTouch() {
             isScrolling = true;
             touchStartX = touchX;
             touchStartY = touchY;
+            
+            // 检查是否在第二页，初始化垂直滚动
+            if (currentPage == 1) {
+                isPage2Scrolling = true;
+                page2TouchStartY = touchY;
+            }
+        } else {
+            // 触摸移动中 - 处理第二页垂直滚动
+            if (currentPage == 1 && isPage2Scrolling) {
+                int deltaY = page2TouchStartY - touchY;
+                if (abs(deltaY) > 10) {  // 最小滚动阈值
+                    page2ScrollY += deltaY / 2;  // 滚动速度减半，更平滑
+                    // 限制滚动范围
+                    if (page2ScrollY < 0) page2ScrollY = 0;
+                    if (page2ScrollY > PAGE2_CONTENT_HEIGHT - PAGE2_VISIBLE_HEIGHT) {
+                        page2ScrollY = PAGE2_CONTENT_HEIGHT - PAGE2_VISIBLE_HEIGHT;
+                    }
+                    page2TouchStartY = touchY;
+                    drawCards();  // 重绘页面
+                }
+            }
         }
     } else {
         if (isScrolling) {
             // 触摸结束
-            isScrolling = false;
-            
-            // 计算滑动距离
             int swipeDistance = touchStartX - map(touchscreen.getPoint().x, 200, 3700, 1, SCREEN_WIDTH);
             
-            // 判断是否切换页面
-            if (swipeDistance > 50 && currentPage < CARD_COUNT - 1) {
-                currentPage++;
-            } else if (swipeDistance < -50 && currentPage > 0) {
-                currentPage--;
+            // 如果不是垂直滚动，处理水平翻页
+            if (currentPage != 1 || !isPage2Scrolling || abs(swipeDistance) > 50) {
+                // 判断是否切换页面
+                if (swipeDistance > 50 && currentPage < CARD_COUNT - 1) {
+                    currentPage++;
+                    page2ScrollY = 0;  // 重置第二页滚动位置
+                } else if (swipeDistance < -50 && currentPage > 0) {
+                    currentPage--;
+                    page2ScrollY = 0;  // 重置第二页滚动位置
+                }
             }
+            
+            isScrolling = false;
+            isPage2Scrolling = false;
             
             // 重绘卡片
             drawCards();
