@@ -277,24 +277,32 @@ uint16_t hexToRGB565(String hex) {
 void handleLyricPacket() {
     int packetSize = lyricUDP.parsePacket();
     if (packetSize > 0) {
-        char buffer[512]; // 增大缓冲区
+        char buffer[1024]; // 增大缓冲区
         int len = lyricUDP.read(buffer, sizeof(buffer) - 1);
         if (len >= 0) {
             buffer[len] = '\0';
             String rawData = String(buffer);
 
-            // 数据包格式为: COLOR|FONT_SIZE|PROGRESS|DURATION|TEXT
-            int firstSep = rawData.indexOf('|');
-            int secondSep = rawData.indexOf('|', firstSep + 1);
-            int thirdSep = rawData.indexOf('|', secondSep + 1);
-            int fourthSep = rawData.indexOf('|', thirdSep + 1);
+            // 数据包格式为: COLOR|FONT_SIZE|PROGRESS|DURATION|IS_PLAYING|HTTP_PORT|TITLE|ARTIST|TEXT
+            int seps[8];
+            int lastSep = -1;
+            bool valid = true;
+            for(int i=0; i<8; i++) {
+                seps[i] = rawData.indexOf('|', lastSep + 1);
+                if(seps[i] == -1) { valid = false; break; }
+                lastSep = seps[i];
+            }
 
-            if (firstSep != -1 && secondSep != -1 && thirdSep != -1 && fourthSep != -1) {
-                String colorHex = rawData.substring(0, firstSep);
-                currentEspFontSize = rawData.substring(firstSep + 1, secondSep).toInt();
-                lyricProgress = rawData.substring(secondSep + 1, thirdSep).toFloat();
-                lyricDuration = rawData.substring(thirdSep + 1, fourthSep).toFloat();
-                String fullText = rawData.substring(fourthSep + 1);
+            if (valid) {
+                String colorHex = rawData.substring(0, seps[0]);
+                currentEspFontSize = rawData.substring(seps[0] + 1, seps[1]).toInt();
+                lyricProgress = rawData.substring(seps[1] + 1, seps[2]).toFloat();
+                lyricDuration = rawData.substring(seps[2] + 1, seps[3]).toFloat();
+                // IS_PLAYING: rawData.substring(seps[3] + 1, seps[4]);
+                // HTTP_PORT: rawData.substring(seps[4] + 1, seps[5]);
+                // TITLE: rawData.substring(seps[5] + 1, seps[6]);
+                // ARTIST: rawData.substring(seps[6] + 1, seps[7]);
+                String fullText = rawData.substring(seps[7] + 1);
                 currentLyricColor = hexToRGB565(colorHex);
 
                 int nIndex = fullText.indexOf('\n');
@@ -305,7 +313,15 @@ void handleLyricPacket() {
                     currentLyric = fullText;
                     currentTranslation = "";
                 }
+
+                // 收到有效数据，重置息屏计时器
+                lastActivityTime = millis();
+                if (screenHidden) {
+                    screenHidden = false;
+                    drawCards();
+                }
             } else {
+                // 降级处理
                 currentLyric = rawData;
                 currentLyricColor = TFT_YELLOW;
             }
@@ -313,22 +329,11 @@ void handleLyricPacket() {
             currentLyric.trim();
 
             if (currentLyric.length() > 0) {
-                // 如果有新歌词且屏幕是黑的，唤醒屏幕
-                if (screenHidden) {
-                    screenHidden = false;
-                    digitalWrite(TFT_BL, HIGH);
-                }
                 lyricActive = true;
                 lastLyricTime = millis();
-                // 收到有效歌词视为活动
-                lastActivityTime = millis();
             } else {
                 lyricActive = false;
             }
-
-            // 收到数据包不论是否有歌词都刷新活动时间？不，为了防止无歌词心跳包阻止熄屏，
-            // 只有在有歌词内容或者用户交互时才更新 lastActivityTime。
-            // 所以这里不再无条件更新 lastActivityTime
 
             // 收到数据后立即重绘
             if (currentPage == 0 && !screenHidden) {
