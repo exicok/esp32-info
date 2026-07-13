@@ -2,15 +2,30 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <HTTPClient.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <TFT_eSPI.h>
 #include <U8g2_for_TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <ArduinoJson.h>
+
+// ============ 用户配置区（可自定义修改） ============
 
 // WiFi配置
 const char* ssid = "ChinaNet-GWpJ";
 const char* password = "12345678";
+
+// 天气配置
+const char* WEATHER_CITY = "祥云县";        // 城市名称
+const float WEATHER_LAT = 25.48;            // 纬度
+const float WEATHER_LON = 100.56;           // 经度
+
+// RSS新闻源配置（可自定义修改）
+const char* RSS_FEED_URL = "https://www.zhihu.com/rss";  // RSS源地址
+const int RSS_MAX_ITEMS = 10;               // 最多显示新闻条数
+
+// ============ 配置区结束 ============
 
 TFT_eSPI tft = TFT_eSPI();
 U8g2_for_TFT_eSPI u8f;
@@ -43,12 +58,90 @@ bool screenHidden = false;
 unsigned long lastLyricTime = 0;
 unsigned long lastTimeUpdate = 0;
 
+// CPU使用率计算
+unsigned long lastCpuUpdate = 0;
+float cpuUsagePercent = 0;
+unsigned long activeTimeUs = 0;
+unsigned long lastLoopStart = 0;
+
 int currentPage = 0;
-#define MAX_PAGES 2
+#define MAX_PAGES 4
+
+// 天气数据结构
+struct WeatherData {
+    String city;
+    String temp;
+    String feelsLike;
+    String humidity;
+    String windSpeed;
+    String windDir;
+    String weather;
+    String icon;
+    String updateTime;
+    bool isValid;
+};
+
+struct ForecastData {
+    String date;
+    String high;
+    String low;
+    String weather;
+    String icon;
+};
+
+WeatherData currentWeather = {"", "", "", "", "", "", "", "", "", false};
+ForecastData forecast[7];
+unsigned long lastWeatherUpdate = 0;
+const unsigned long WEATHER_UPDATE_INTERVAL = 1800000; // 30分钟更新一次
+bool weatherLoading = false;
+String weatherError = "";
+String weatherCity = WEATHER_CITY; // 使用配置区的城市名称
+
+// 祥云县坐标（使用配置区）
+float weatherLat = WEATHER_LAT;
+float weatherLon = WEATHER_LON;
+
+// RSS新闻数据结构
+struct RSSItem {
+    String title;
+    String link;
+    String pubDate;
+};
+
+RSSItem rssItems[RSS_MAX_ITEMS];
+int rssItemCount = 0;
+unsigned long lastRSSUpdate = 0;
+const unsigned long RSS_UPDATE_INTERVAL = 600000; // 10分钟更新一次
+bool rssLoading = false;
+String rssError = "";
+int rssScrollOffset = 0;
+
+// WMO天气代码转中文
+String wmoWeatherDesc(int code) {
+    switch (code) {
+        case 0: return "晴";
+        case 1: return "大部晴";
+        case 2: return "多云";
+        case 3: return "阴";
+        case 45: case 48: return "雾";
+        case 51: case 53: case 55: return "毛毛雨";
+        case 56: case 57: return "冻毛毛雨";
+        case 61: case 63: case 65: return "雨";
+        case 66: case 67: return "冻雨";
+        case 71: case 73: case 75: return "雪";
+        case 77: return "雪粒";
+        case 80: case 81: case 82: return "阵雨";
+        case 85: case 86: return "阵雪";
+        case 95: return "雷暴";
+        case 96: case 99: return "雷暴冰雹";
+        default: return "未知";
+    }
+}
 
 // 触控手势逻辑
 int startX = -1, startY = -1;
 int scrollOffset = 0;
+int weatherScrollOffset = 0; // 天气页面专用滚动偏移
 bool isSwiping = false;
 const int SWIPE_MIN_X = 800; // 左右滑动触发阈值 (原始坐标)
 const int SWIPE_MIN_Y = 300; // 上下滑动触发阈值 (用于翻页)
@@ -105,6 +198,164 @@ void drawTaskbar() {
     u8f.print(currentTimeStr);
 }
 
+// 天气API配置（使用Open-Meteo开源API，无需API key）
+const char* WEATHER_API_BASE = "https://api.open-meteo.com/v1/forecast";
+
+void fetchWeatherData() {
+    if (weatherLoading) return;
+    weatherLoading = true;
+    weatherError = "";
+
+    HTTPClient http;
+    // Open-Meteo API: 使用坐标获取天气
+    String url = String(WEATHER_API_BASE) +
+        "?latitude=" + String(weatherLat, 4) +
+        "&longitude=" + String(weatherLon, 4) +
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m" +
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min" +
+        "&timezone=Asia/Shanghai" +
+        "&forecast_days=7";
+
+    Serial.println("Fetching weather: " + url);
+    http.begin(url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        DynamicJsonDocument doc(8192);
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (!error) {
+            // 解析当前天气
+            JsonObject current = doc["current"];
+            currentWeather.city = weatherCity;
+            currentWeather.temp = String(current["temperature_2m"].as<float>(), 1) + "°C";
+            currentWeather.feelsLike = String(current["apparent_temperature"].as<float>(), 1) + "°C";
+            currentWeather.humidity = String(current["relative_humidity_2m"].as<int>()) + "%";
+            currentWeather.windSpeed = String(current["wind_speed_10m"].as<float>(), 1) + " km/h";
+
+            int windDir = current["wind_direction_10m"].as<int>();
+            if (windDir < 22 || windDir >= 337) currentWeather.windDir = "北";
+            else if (windDir < 67) currentWeather.windDir = "东北";
+            else if (windDir < 112) currentWeather.windDir = "东";
+            else if (windDir < 157) currentWeather.windDir = "东南";
+            else if (windDir < 202) currentWeather.windDir = "南";
+            else if (windDir < 247) currentWeather.windDir = "西南";
+            else if (windDir < 292) currentWeather.windDir = "西";
+            else currentWeather.windDir = "西北";
+
+            int weatherCode = current["weather_code"].as<int>();
+            currentWeather.weather = wmoWeatherDesc(weatherCode);
+            currentWeather.icon = currentWeather.weather;
+            currentWeather.updateTime = currentDateStr + " " + currentTimeStr;
+            currentWeather.isValid = true;
+
+            // 解析未来7天预报
+            JsonObject daily = doc["daily"];
+            JsonArray timeArr = daily["time"];
+            JsonArray maxTempArr = daily["temperature_2m_max"];
+            JsonArray minTempArr = daily["temperature_2m_min"];
+            JsonArray weatherCodeArr = daily["weather_code"];
+
+            for (int i = 0; i < min(7, (int)timeArr.size()); i++) {
+                forecast[i].date = timeArr[i].as<String>();
+                forecast[i].high = String(maxTempArr[i].as<float>(), 1) + "°";
+                forecast[i].low = String(minTempArr[i].as<float>(), 1) + "°";
+                forecast[i].weather = wmoWeatherDesc(weatherCodeArr[i].as<int>());
+                forecast[i].icon = forecast[i].weather;
+            }
+
+            Serial.println("Weather updated successfully");
+        } else {
+            weatherError = "JSON解析失败";
+            currentWeather.isValid = false;
+        }
+    } else {
+        weatherError = "HTTP错误: " + String(httpCode);
+        currentWeather.isValid = false;
+    }
+
+    http.end();
+    weatherLoading = false;
+    // 无论成功失败都更新时间戳，避免频繁重试
+    lastWeatherUpdate = millis();
+}
+
+// RSS解析函数
+void fetchRSS() {
+    if (rssLoading) return;
+    rssLoading = true;
+    rssError = "";
+
+    HTTPClient http;
+    http.begin(RSS_FEED_URL);
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+        String payload = http.getString();
+
+        // 简单解析RSS XML
+        rssItemCount = 0;
+        int pos = 0;
+        while (rssItemCount < RSS_MAX_ITEMS) {
+            int itemStart = payload.indexOf("<item>", pos);
+            if (itemStart == -1) break;
+            int itemEnd = payload.indexOf("</item>", itemStart);
+            if (itemEnd == -1) break;
+
+            String itemStr = payload.substring(itemStart, itemEnd);
+
+            // 提取标题
+            int titleStart = itemStr.indexOf("<title>");
+            int titleEnd = itemStr.indexOf("</title>");
+            if (titleStart != -1 && titleEnd != -1) {
+                rssItems[rssItemCount].title = itemStr.substring(titleStart + 7, titleEnd);
+                // 清理CDATA
+                rssItems[rssItemCount].title.replace("<![CDATA[", "");
+                rssItems[rssItemCount].title.replace("]]>", "");
+            }
+
+            // 提取链接
+            int linkStart = itemStr.indexOf("<link>");
+            int linkEnd = itemStr.indexOf("</link>");
+            if (linkStart != -1 && linkEnd != -1) {
+                rssItems[rssItemCount].link = itemStr.substring(linkStart + 6, linkEnd);
+            }
+
+            // 提取发布时间
+            int pubStart = itemStr.indexOf("<pubDate>");
+            int pubEnd = itemStr.indexOf("</pubDate>");
+            if (pubStart != -1 && pubEnd != -1) {
+                rssItems[rssItemCount].pubDate = itemStr.substring(pubStart + 9, pubEnd);
+            }
+
+            rssItemCount++;
+            pos = itemEnd + 7;
+        }
+
+        Serial.println("RSS updated, items: " + String(rssItemCount));
+    } else {
+        rssError = "RSS获取失败: " + String(httpCode);
+    }
+
+    http.end();
+    rssLoading = false;
+    lastRSSUpdate = millis();
+}
+
+String formatUptime(unsigned long ms) {
+    unsigned long seconds = ms / 1000;
+    unsigned long days = seconds / 86400;
+    seconds %= 86400;
+    unsigned long hours = seconds / 3600;
+    seconds %= 3600;
+    unsigned long minutes = seconds / 60;
+    seconds %= 60;
+    char buf[32];
+    sprintf(buf, "%lud %02lu:%02lu:%02lu", days, hours, minutes, seconds);
+    return String(buf);
+}
+
 void drawInfoContent() {
     int curY = 50 + scrollOffset;
     int lineHeight = 25;
@@ -120,20 +371,261 @@ void drawInfoContent() {
         curY += lineHeight;
     };
 
+    // 网络状态
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 网络状态 ---"); curY += lineHeight;
-    drawRow("网络名称:", String(WiFi.SSID()), TFT_WHITE);
+    drawRow("网络名称:", WiFi.SSID(), TFT_WHITE);
     drawRow("IP 地址:", WiFi.localIP().toString(), TFT_GREEN);
     drawRow("信号强度:", String(WiFi.RSSI()) + " dBm", TFT_WHITE);
     drawRow("网关地址:", WiFi.gatewayIP().toString(), TFT_WHITE);
+    drawRow("MAC地址:", WiFi.macAddress(), TFT_WHITE);
+    drawRow("子网掩码:", WiFi.subnetMask().toString(), TFT_WHITE);
+    drawRow("DNS:", WiFi.dnsIP().toString(), TFT_WHITE);
+    drawRow("信道:", String(WiFi.channel()), TFT_WHITE);
+    drawRow("BSSID:", WiFi.BSSIDstr(), TFT_WHITE);
 
     curY += 10;
+    // 硬件信息
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 硬件信息 ---"); curY += lineHeight;
     drawRow("CPU 频率:", String(ESP.getCpuFreqMHz()) + " MHz", TFT_WHITE);
-    drawRow("可用内存:", String(ESP.getFreeHeap()/1024) + " KB", TFT_GREEN);
-    drawRow("Flash大小:", String(ESP.getFlashChipSize()/1024/1024) + " MB", TFT_WHITE);
+    drawRow("芯片型号:", ESP.getChipModel(), TFT_WHITE);
+    drawRow("芯片版本:", String(ESP.getChipRevision()), TFT_WHITE);
+    drawRow("核心数:", String(ESP.getChipCores()), TFT_WHITE);
     drawRow("系统版本:", String(ESP.getSdkVersion()), TFT_WHITE);
+
+    curY += 10;
+    // 内存信息
+    u8f.setForegroundColor(TFT_YELLOW);
+    u8f.setCursor(10, curY); u8f.print("--- 内存信息 ---"); curY += lineHeight;
+    drawRow("可用堆内存:", String(ESP.getFreeHeap() / 1024) + " KB", TFT_GREEN);
+    drawRow("最小可用堆:", String(ESP.getMinFreeHeap() / 1024) + " KB", TFT_WHITE);
+    drawRow("总堆内存:", String(ESP.getHeapSize() / 1024) + " KB", TFT_WHITE);
+    if (psramFound()) {
+        drawRow("PSRAM总量:", String(ESP.getPsramSize() / 1024) + " KB", TFT_WHITE);
+        drawRow("PSRAM可用:", String(ESP.getFreePsram() / 1024) + " KB", TFT_GREEN);
+    }
+
+    curY += 10;
+    // ROM/Flash信息
+    u8f.setForegroundColor(TFT_YELLOW);
+    u8f.setCursor(10, curY); u8f.print("--- ROM/Flash ---"); curY += lineHeight;
+    drawRow("Flash大小:", String(ESP.getFlashChipSize() / 1024 / 1024) + " MB", TFT_WHITE);
+    drawRow("Flash速度:", String(ESP.getFlashChipSpeed() / 1000000) + " MHz", TFT_WHITE);
+
+    curY += 10;
+    // 系统状态
+    u8f.setForegroundColor(TFT_YELLOW);
+    u8f.setCursor(10, curY); u8f.print("--- 系统状态 ---"); curY += lineHeight;
+    char cpuBuf[16];
+    sprintf(cpuBuf, "%.1f%%", cpuUsagePercent);
+    drawRow("CPU占有率:", cpuBuf, TFT_CYAN);
+    drawRow("开机时间:", formatUptime(millis()), TFT_WHITE);
+}
+
+void drawWeatherPage() {
+    tft.fillScreen(TFT_BLACK);
+    // 天气页不显示任务栏
+
+    u8f.setFontMode(1);
+    u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+
+    if (weatherLoading) {
+        u8f.setForegroundColor(TFT_YELLOW);
+        u8f.setCursor(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT / 2);
+        u8f.print("加载中...");
+        return;
+    }
+
+    if (!currentWeather.isValid) {
+        u8f.setForegroundColor(TFT_RED);
+        u8f.setCursor(20, 60);
+        u8f.print("天气数据获取失败");
+        u8f.setForegroundColor(TFT_WHITE);
+        u8f.setCursor(20, 90);
+        u8f.print(weatherError);
+        u8f.setCursor(20, 120);
+        u8f.print("城市: " + weatherCity);
+        return;
+    }
+
+    int y = 15 + weatherScrollOffset; // 无任务栏，起始位置更靠上
+
+    // 城市名称（居中显示）
+    if (y > 0 && y < SCREEN_HEIGHT) {
+        u8f.setForegroundColor(TFT_CYAN);
+        u8f.setFont(u8g2_font_wqy12_t_gb2312);
+        int cityWidth = u8f.getUTF8Width(currentWeather.city.c_str());
+        u8f.setCursor((SCREEN_WIDTH - cityWidth) / 2, y);
+        u8f.print(currentWeather.city);
+    }
+    y += 35;
+
+    // 当前温度（大号字体，居中）- 只显示数字部分
+    if (y > 24 && y < SCREEN_HEIGHT) {
+        u8f.setForegroundColor(TFT_WHITE);
+        u8f.setFont(u8g2_font_logisoso32_tn);
+        // 提取温度数字部分（去掉°C）
+        String tempNum = currentWeather.feelsLike;
+        int degreeIdx = tempNum.indexOf("°");
+        if (degreeIdx > 0) tempNum = tempNum.substring(0, degreeIdx);
+        int tempWidth = u8f.getUTF8Width(tempNum.c_str());
+        // 温度数字居中
+        int tempX = (SCREEN_WIDTH - tempWidth) / 2;
+        u8f.setCursor(tempX, y);
+        u8f.print(tempNum);
+        // 在温度后显示单位（用普通字体）
+        u8f.setFont(u8g2_font_wqy12_t_gb2312);
+        u8f.setCursor(tempX + tempWidth + 5, y + 12);
+        u8f.print("°C");
+    }
+    y += 50;
+
+    // 天气状况（居中）
+    if (y > 24 && y < SCREEN_HEIGHT) {
+        u8f.setForegroundColor(TFT_YELLOW);
+        u8f.setFont(u8g2_font_wqy12_t_gb2312);
+        int weatherWidth = u8f.getUTF8Width(currentWeather.weather.c_str());
+        u8f.setCursor((SCREEN_WIDTH - weatherWidth) / 2, y);
+        u8f.print(currentWeather.weather);
+    }
+    y += 25;
+
+    // 详细信息（两列布局）
+    if (y > 24 && y < SCREEN_HEIGHT) {
+        u8f.setForegroundColor(TFT_LIGHTGREY);
+        u8f.setCursor(30, y);
+        u8f.print("湿度: " + currentWeather.humidity);
+        u8f.setCursor(180, y);
+        u8f.print("风向: " + currentWeather.windDir);
+    }
+    y += 18;
+    if (y > 24 && y < SCREEN_HEIGHT) {
+        u8f.setCursor(30, y);
+        u8f.print("风速: " + currentWeather.windSpeed);
+    }
+    y += 25;
+
+    // 分隔线
+    if (y > 24 && y < SCREEN_HEIGHT) {
+        tft.drawFastHLine(20, y, SCREEN_WIDTH - 40, tft.color565(60, 60, 60));
+    }
+    y += 12;
+
+    // 未来7天预报标题
+    if (y > 24 && y < SCREEN_HEIGHT) {
+        u8f.setForegroundColor(TFT_YELLOW);
+        u8f.setCursor(20, y);
+        u8f.print("未来7天预报");
+    }
+    y += 22;
+
+    // 7天预报（详细布局，每行显示更多信息）
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    for (int i = 0; i < 7; i++) {
+        if (y > SCREEN_HEIGHT + 20) break;
+
+        String dateStr = forecast[i].date.substring(5); // 只显示月-日
+
+        // 日期（青色）
+        if (y > 24 && y < SCREEN_HEIGHT) {
+            u8f.setForegroundColor(TFT_CYAN);
+            u8f.setCursor(20, y);
+            u8f.print(dateStr);
+
+            // 天气（白色）
+            u8f.setForegroundColor(TFT_WHITE);
+            u8f.setCursor(75, y);
+            u8f.print(forecast[i].weather);
+
+            // 最高温（红色）
+            u8f.setForegroundColor(TFT_RED);
+            u8f.setCursor(150, y);
+            u8f.print(forecast[i].high);
+
+            // 最低温（蓝色）
+            u8f.setForegroundColor(TFT_BLUE);
+            u8f.setCursor(210, y);
+            u8f.print(forecast[i].low);
+        }
+        y += 22;
+    }
+
+    // 绘制滚动条指示器
+    if (weatherScrollOffset < 0) {
+        int scrollBarHeight = 40;
+        int scrollBarY = map(weatherScrollOffset, -300, 0, 30, SCREEN_HEIGHT - scrollBarHeight - 30);
+        tft.fillRect(SCREEN_WIDTH - 4, scrollBarY, 3, scrollBarHeight, tft.color565(100, 100, 100));
+    }
+}
+
+void drawRSSPage() {
+    tft.fillScreen(TFT_BLACK);
+    drawTaskbar();
+
+    u8f.setFontMode(1);
+    u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+
+    if (rssLoading) {
+        u8f.setForegroundColor(TFT_YELLOW);
+        u8f.setCursor(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT / 2);
+        u8f.print("加载中...");
+        return;
+    }
+
+    if (rssItemCount == 0) {
+        u8f.setForegroundColor(TFT_RED);
+        u8f.setCursor(20, 60);
+        u8f.print("暂无新闻");
+        if (rssError.length() > 0) {
+            u8f.setForegroundColor(TFT_WHITE);
+            u8f.setCursor(20, 90);
+            u8f.print(rssError);
+        }
+        return;
+    }
+
+    // 标题
+    u8f.setForegroundColor(TFT_CYAN);
+    u8f.setCursor(20, 35);
+    u8f.print("新闻资讯");
+    u8f.setForegroundColor(TFT_LIGHTGREY);
+    u8f.setCursor(120, 35);
+    u8f.print("(" + String(rssItemCount) + "条)");
+
+    // 新闻列表
+    int y = 60 + rssScrollOffset;
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+
+    for (int i = 0; i < rssItemCount; i++) {
+        if (y > SCREEN_HEIGHT + 20) break;
+
+        if (y > 24 && y < SCREEN_HEIGHT) {
+            // 序号（青色）
+            u8f.setForegroundColor(TFT_CYAN);
+            u8f.setCursor(10, y);
+            u8f.print(String(i + 1) + ".");
+
+            // 标题（白色，自动换行）
+            u8f.setForegroundColor(TFT_WHITE);
+            String title = rssItems[i].title;
+            if (title.length() > 20) {
+                title = title.substring(0, 20) + "...";
+            }
+            u8f.setCursor(30, y);
+            u8f.print(title);
+        }
+        y += 22;
+    }
+
+    // 绘制滚动条指示器
+    if (rssScrollOffset < 0) {
+        int scrollBarHeight = 40;
+        int scrollBarY = map(rssScrollOffset, -300, 0, 30, SCREEN_HEIGHT - scrollBarHeight - 30);
+        tft.fillRect(SCREEN_WIDTH - 4, scrollBarY, 3, scrollBarHeight, tft.color565(100, 100, 100));
+    }
 }
 
 void drawDisplay() {
@@ -150,10 +642,14 @@ void drawDisplay() {
             tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(5);
             tft.setTextDatum(CC_DATUM); tft.drawString(currentTimeStr, 160, 120);
         }
-    } else {
+    } else if (currentPage == 1) {
         tft.fillScreen(TFT_BLACK);
         drawInfoContent();
         drawTaskbar();
+    } else if (currentPage == 2) {
+        drawWeatherPage();
+    } else if (currentPage == 3) {
+        drawRSSPage();
     }
 }
 
@@ -189,10 +685,17 @@ void setup() {
     while (WiFi.status() != WL_CONNECTED) delay(500);
     timeClient = new NTPClient(ntpUDP, "ntp.aliyun.com", 8 * 3600, 60000);
     timeClient->begin(); lyricUDP.begin(lyric_port);
+
+    // 首次获取天气数据
+    fetchWeatherData();
+    // 首次获取RSS数据
+    fetchRSS();
     drawDisplay();
 }
 
 void loop() {
+    unsigned long loopStart = micros();
+
     handleLyricPacket();
 
     if (millis() - lastTimeUpdate >= 1000) {
@@ -202,8 +705,21 @@ void loop() {
         struct tm* ptm = gmtime((time_t*)&epochTime);
         char dateBuffer[20]; sprintf(dateBuffer, "%04d-%02d-%02d", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
         currentDateStr = String(dateBuffer);
-        if (currentPage == 1 || !lyricActive) drawDisplay();
+        // 天气页（currentPage == 2）不参与时间刷新
+        if (currentPage != 2 && (currentPage == 1 || !lyricActive)) drawDisplay();
         lastTimeUpdate = millis();
+    }
+
+    // 定期更新天气数据
+    if (millis() - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL) {
+        fetchWeatherData();
+        if (currentPage == 2) drawDisplay();
+    }
+
+    // 定期更新RSS数据
+    if (millis() - lastRSSUpdate >= RSS_UPDATE_INTERVAL) {
+        fetchRSS();
+        if (currentPage == 3) drawDisplay();
     }
 
     if (touchscreen.touched()) {
@@ -219,7 +735,21 @@ void loop() {
                 if (currentPage == 1 && abs(dy) > abs(dx) && abs(dy) > 200) {
                     // 信息页纵向滑动：实时滚动
                     scrollOffset += dy / 20;
-                    scrollOffset = constrain(scrollOffset, -200, 0);
+                    scrollOffset = constrain(scrollOffset, -500, 0);
+                    drawDisplay();
+                    startY = p.y; // 更新起始点以平滑滚动
+                }
+                else if (currentPage == 2 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                    // 天气页纵向滑动：实时滚动
+                    weatherScrollOffset += dy / 20;
+                    weatherScrollOffset = constrain(weatherScrollOffset, -300, 0);
+                    drawDisplay();
+                    startY = p.y; // 更新起始点以平滑滚动
+                }
+                else if (currentPage == 3 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                    // RSS页纵向滑动：实时滚动
+                    rssScrollOffset += dy / 20;
+                    rssScrollOffset = constrain(rssScrollOffset, -300, 0);
                     drawDisplay();
                     startY = p.y; // 更新起始点以平滑滚动
                 }
@@ -233,10 +763,12 @@ void loop() {
             if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
                 currentPage = (currentPage - 1 + MAX_PAGES) % MAX_PAGES;
                 scrollOffset = 0;
+                weatherScrollOffset = 0;
                 drawDisplay();
             } else if (finalDx < -SWIPE_MIN_X) { // 向左划：下一页
                 currentPage = (currentPage + 1) % MAX_PAGES;
                 scrollOffset = 0;
+                weatherScrollOffset = 0;
                 drawDisplay();
             }
             startX = -1; startY = -1;
@@ -246,5 +778,16 @@ void loop() {
     if (lyricActive && millis() - lastLyricTime > 15000) {
         lyricActive = false; drawDisplay();
     }
+
+    // 计算CPU使用率（每秒更新一次）
+    unsigned long loopEnd = micros();
+    activeTimeUs += (loopEnd - loopStart);
+    if (millis() - lastCpuUpdate >= 1000) {
+        cpuUsagePercent = (activeTimeUs / 10000.0); // 1秒=1000ms=1000000us, 百分比=active/10000
+        if (cpuUsagePercent > 100.0) cpuUsagePercent = 100.0;
+        activeTimeUs = 0;
+        lastCpuUpdate = millis();
+    }
+
     delay(10);
 }
