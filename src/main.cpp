@@ -21,10 +21,6 @@ const char* WEATHER_CITY = "祥云县";        // 城市名称
 const float WEATHER_LAT = 25.48;            // 纬度
 const float WEATHER_LON = 100.56;           // 经度
 
-// RSS新闻源配置（可自定义修改）
-const char* RSS_FEED_URL = "https://www.zhihu.com/rss";  // RSS源地址
-const int RSS_MAX_ITEMS = 10;               // 最多显示新闻条数
-
 // ============ 配置区结束 ============
 
 TFT_eSPI tft = TFT_eSPI();
@@ -52,6 +48,7 @@ String currentLyric = "";
 String currentTranslation = "";
 uint16_t currentLyricColor = TFT_YELLOW;
 String currentTimeStr = "00:00:00";
+String lastTimeStr = ""; // 用于局部刷新的上一次时间
 String currentDateStr = "2024-01-01";
 bool lyricActive = false;
 bool screenHidden = false;
@@ -65,7 +62,7 @@ unsigned long activeTimeUs = 0;
 unsigned long lastLoopStart = 0;
 
 int currentPage = 0;
-#define MAX_PAGES 4
+#define MAX_PAGES 3
 
 // 天气数据结构
 struct WeatherData {
@@ -101,21 +98,6 @@ String weatherCity = WEATHER_CITY; // 使用配置区的城市名称
 float weatherLat = WEATHER_LAT;
 float weatherLon = WEATHER_LON;
 
-// RSS新闻数据结构
-struct RSSItem {
-    String title;
-    String link;
-    String pubDate;
-};
-
-RSSItem rssItems[RSS_MAX_ITEMS];
-int rssItemCount = 0;
-unsigned long lastRSSUpdate = 0;
-const unsigned long RSS_UPDATE_INTERVAL = 600000; // 10分钟更新一次
-bool rssLoading = false;
-String rssError = "";
-int rssScrollOffset = 0;
-
 // WMO天气代码转中文
 String wmoWeatherDesc(int code) {
     switch (code) {
@@ -140,9 +122,10 @@ String wmoWeatherDesc(int code) {
 
 // 触控手势逻辑
 int startX = -1, startY = -1;
+int lastTouchX = -1, lastTouchY = -1; // 保存最后的有效触摸坐标
+bool isSwiping = false; // 标记是否为滑动操作
 int scrollOffset = 0;
 int weatherScrollOffset = 0; // 天气页面专用滚动偏移
-bool isSwiping = false;
 const int SWIPE_MIN_X = 800; // 左右滑动触发阈值 (原始坐标)
 const int SWIPE_MIN_Y = 300; // 上下滑动触发阈值 (用于翻页)
 
@@ -279,68 +262,6 @@ void fetchWeatherData() {
     weatherLoading = false;
     // 无论成功失败都更新时间戳，避免频繁重试
     lastWeatherUpdate = millis();
-}
-
-// RSS解析函数
-void fetchRSS() {
-    if (rssLoading) return;
-    rssLoading = true;
-    rssError = "";
-
-    HTTPClient http;
-    http.begin(RSS_FEED_URL);
-    int httpCode = http.GET();
-
-    if (httpCode > 0) {
-        String payload = http.getString();
-
-        // 简单解析RSS XML
-        rssItemCount = 0;
-        int pos = 0;
-        while (rssItemCount < RSS_MAX_ITEMS) {
-            int itemStart = payload.indexOf("<item>", pos);
-            if (itemStart == -1) break;
-            int itemEnd = payload.indexOf("</item>", itemStart);
-            if (itemEnd == -1) break;
-
-            String itemStr = payload.substring(itemStart, itemEnd);
-
-            // 提取标题
-            int titleStart = itemStr.indexOf("<title>");
-            int titleEnd = itemStr.indexOf("</title>");
-            if (titleStart != -1 && titleEnd != -1) {
-                rssItems[rssItemCount].title = itemStr.substring(titleStart + 7, titleEnd);
-                // 清理CDATA
-                rssItems[rssItemCount].title.replace("<![CDATA[", "");
-                rssItems[rssItemCount].title.replace("]]>", "");
-            }
-
-            // 提取链接
-            int linkStart = itemStr.indexOf("<link>");
-            int linkEnd = itemStr.indexOf("</link>");
-            if (linkStart != -1 && linkEnd != -1) {
-                rssItems[rssItemCount].link = itemStr.substring(linkStart + 6, linkEnd);
-            }
-
-            // 提取发布时间
-            int pubStart = itemStr.indexOf("<pubDate>");
-            int pubEnd = itemStr.indexOf("</pubDate>");
-            if (pubStart != -1 && pubEnd != -1) {
-                rssItems[rssItemCount].pubDate = itemStr.substring(pubStart + 9, pubEnd);
-            }
-
-            rssItemCount++;
-            pos = itemEnd + 7;
-        }
-
-        Serial.println("RSS updated, items: " + String(rssItemCount));
-    } else {
-        rssError = "RSS获取失败: " + String(httpCode);
-    }
-
-    http.end();
-    rssLoading = false;
-    lastRSSUpdate = millis();
 }
 
 String formatUptime(unsigned long ms) {
@@ -560,87 +481,48 @@ void drawWeatherPage() {
     }
 }
 
-void drawRSSPage() {
-    tft.fillScreen(TFT_BLACK);
-    drawTaskbar();
-
-    u8f.setFontMode(1);
-    u8f.setBackgroundColor(TFT_BLACK);
-    u8f.setFont(u8g2_font_wqy12_t_gb2312);
-
-    if (rssLoading) {
-        u8f.setForegroundColor(TFT_YELLOW);
-        u8f.setCursor(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT / 2);
-        u8f.print("加载中...");
-        return;
-    }
-
-    if (rssItemCount == 0) {
-        u8f.setForegroundColor(TFT_RED);
-        u8f.setCursor(20, 60);
-        u8f.print("暂无新闻");
-        if (rssError.length() > 0) {
-            u8f.setForegroundColor(TFT_WHITE);
-            u8f.setCursor(20, 90);
-            u8f.print(rssError);
-        }
-        return;
-    }
-
-    // 标题
-    u8f.setForegroundColor(TFT_CYAN);
-    u8f.setCursor(20, 35);
-    u8f.print("新闻资讯");
-    u8f.setForegroundColor(TFT_LIGHTGREY);
-    u8f.setCursor(120, 35);
-    u8f.print("(" + String(rssItemCount) + "条)");
-
-    // 新闻列表
-    int y = 60 + rssScrollOffset;
-    u8f.setFont(u8g2_font_wqy12_t_gb2312);
-
-    for (int i = 0; i < rssItemCount; i++) {
-        if (y > SCREEN_HEIGHT + 20) break;
-
-        if (y > 24 && y < SCREEN_HEIGHT) {
-            // 序号（青色）
-            u8f.setForegroundColor(TFT_CYAN);
-            u8f.setCursor(10, y);
-            u8f.print(String(i + 1) + ".");
-
-            // 标题（白色，自动换行）
-            u8f.setForegroundColor(TFT_WHITE);
-            String title = rssItems[i].title;
-            if (title.length() > 20) {
-                title = title.substring(0, 20) + "...";
-            }
-            u8f.setCursor(30, y);
-            u8f.print(title);
-        }
-        y += 22;
-    }
-
-    // 绘制滚动条指示器
-    if (rssScrollOffset < 0) {
-        int scrollBarHeight = 40;
-        int scrollBarY = map(rssScrollOffset, -300, 0, 30, SCREEN_HEIGHT - scrollBarHeight - 30);
-        tft.fillRect(SCREEN_WIDTH - 4, scrollBarY, 3, scrollBarHeight, tft.color565(100, 100, 100));
-    }
-}
-
 void drawDisplay() {
     if (currentPage == 0) {
-        tft.fillScreen(TFT_BLACK);
         if (lyricActive && currentLyric.length() > 0) {
+            tft.fillScreen(TFT_BLACK);
             u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
             int lyricLines = drawWrappedTextCentered(currentLyric, 160, 100, SCREEN_WIDTH - 20, 22);
             if (currentTranslation.length() > 0) {
                 u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
                 drawWrappedTextCentered(currentTranslation, 160, 100 + lyricLines * 22 + 8, SCREEN_WIDTH - 20, 18);
             }
+            lastTimeStr = ""; // 重置，下次显示时间时全量绘制
         } else {
-            tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(5);
-            tft.setTextDatum(CC_DATUM); tft.drawString(currentTimeStr, 160, 120);
+            // 时间显示 - 局部刷新
+            tft.setTextSize(5);
+            tft.setTextDatum(CC_DATUM);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            
+            // 计算时间字符串的宽度和每个字符的位置
+            int charWidth = tft.textWidth("0"); // 单个数字的宽度
+            int totalWidth = charWidth * 8; // "HH:MM:SS" 共8个字符
+            int startX = (SCREEN_WIDTH - totalWidth) / 2;
+            int y = 120;
+            
+            if (lastTimeStr.length() != currentTimeStr.length()) {
+                // 首次显示或格式变化，全量绘制
+                tft.fillScreen(TFT_BLACK);
+                tft.drawString(currentTimeStr, 160, y);
+            } else {
+                // 逐字符比较，只重绘变化的字符
+                for (int i = 0; i < currentTimeStr.length(); i++) {
+                    if (currentTimeStr[i] != lastTimeStr[i]) {
+                        // 计算该字符的位置
+                        int charX = startX + i * charWidth + charWidth / 2;
+                        // 清除该字符区域
+                        tft.fillRect(charX - charWidth / 2, y - 30, charWidth, 60, TFT_BLACK);
+                        // 重绘该字符
+                        String ch = String(currentTimeStr[i]);
+                        tft.drawString(ch, charX, y);
+                    }
+                }
+            }
+            lastTimeStr = currentTimeStr;
         }
     } else if (currentPage == 1) {
         tft.fillScreen(TFT_BLACK);
@@ -648,8 +530,6 @@ void drawDisplay() {
         drawTaskbar();
     } else if (currentPage == 2) {
         drawWeatherPage();
-    } else if (currentPage == 3) {
-        drawRSSPage();
     }
 }
 
@@ -688,8 +568,6 @@ void setup() {
 
     // 首次获取天气数据
     fetchWeatherData();
-    // 首次获取RSS数据
-    fetchRSS();
     drawDisplay();
 }
 
@@ -706,7 +584,8 @@ void loop() {
         char dateBuffer[20]; sprintf(dateBuffer, "%04d-%02d-%02d", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
         currentDateStr = String(dateBuffer);
         // 天气页（currentPage == 2）不参与时间刷新
-        if (currentPage != 2 && (currentPage == 1 || !lyricActive)) drawDisplay();
+        // 时间页（currentPage == 0）非歌词模式时刷新，或信息页（currentPage == 1）时刷新
+        if ((currentPage == 0 && !lyricActive) || currentPage == 1) drawDisplay();
         lastTimeUpdate = millis();
     }
 
@@ -716,18 +595,19 @@ void loop() {
         if (currentPage == 2) drawDisplay();
     }
 
-    // 定期更新RSS数据
-    if (millis() - lastRSSUpdate >= RSS_UPDATE_INTERVAL) {
-        fetchRSS();
-        if (currentPage == 3) drawDisplay();
-    }
-
     if (touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();
+        // 保存有效的触摸坐标
+        lastTouchX = p.x;
+        lastTouchY = p.y;
         if (screenHidden) {
             screenHidden = false; digitalWrite(TFT_BL, HIGH); drawDisplay();
         } else {
-            if (startX == -1) { startX = p.x; startY = p.y; }
+            if (startX == -1) { 
+                startX = p.x; 
+                startY = p.y; 
+                isSwiping = false; // 重置滑动标记
+            }
             else {
                 int dx = p.x - startX;
                 int dy = p.y - startY;
@@ -738,6 +618,7 @@ void loop() {
                     scrollOffset = constrain(scrollOffset, -500, 0);
                     drawDisplay();
                     startY = p.y; // 更新起始点以平滑滚动
+                    isSwiping = true; // 标记为滑动操作
                 }
                 else if (currentPage == 2 && abs(dy) > abs(dx) && abs(dy) > 200) {
                     // 天气页纵向滑动：实时滚动
@@ -745,33 +626,40 @@ void loop() {
                     weatherScrollOffset = constrain(weatherScrollOffset, -300, 0);
                     drawDisplay();
                     startY = p.y; // 更新起始点以平滑滚动
-                }
-                else if (currentPage == 3 && abs(dy) > abs(dx) && abs(dy) > 200) {
-                    // RSS页纵向滑动：实时滚动
-                    rssScrollOffset += dy / 20;
-                    rssScrollOffset = constrain(rssScrollOffset, -300, 0);
-                    drawDisplay();
-                    startY = p.y; // 更新起始点以平滑滚动
+                    isSwiping = true;
                 }
             }
         }
     } else {
         if (startX != -1) {
-            TS_Point p = touchscreen.getPoint(); // 实际上此时touched为false，但我们需要最后的坐标，XPT2046通常会保留
-            // 处理横向滑动切换页面
-            int finalDx = touchscreen.getPoint().x - startX;
-            if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
-                currentPage = (currentPage - 1 + MAX_PAGES) % MAX_PAGES;
-                scrollOffset = 0;
-                weatherScrollOffset = 0;
-                drawDisplay();
-            } else if (finalDx < -SWIPE_MIN_X) { // 向左划：下一页
-                currentPage = (currentPage + 1) % MAX_PAGES;
-                scrollOffset = 0;
-                weatherScrollOffset = 0;
-                drawDisplay();
+            // 使用保存的最后有效触摸坐标
+            int finalX = lastTouchX;
+            int finalY = lastTouchY;
+            int finalDx = finalX - startX;
+            int finalDy = finalY - startY;
+
+            // 只有当不是滑动操作时才处理点击
+            if (!isSwiping) {
+                // 其他页面的横向滑动切换
+                if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
+                    currentPage = (currentPage - 1 + MAX_PAGES) % MAX_PAGES;
+                    scrollOffset = 0;
+                    weatherScrollOffset = 0;
+                    lastTimeStr = ""; // 重置时间显示状态
+                    drawDisplay();
+                } else if (finalDx < -SWIPE_MIN_X) { // 向左划：下一页
+                    currentPage = (currentPage + 1) % MAX_PAGES;
+                    scrollOffset = 0;
+                    weatherScrollOffset = 0;
+                    lastTimeStr = ""; // 重置时间显示状态
+                    drawDisplay();
+                }
             }
-            startX = -1; startY = -1;
+            
+            // 重置触摸状态
+            startX = -1; 
+            startY = -1;
+            isSwiping = false;
         }
     }
 
