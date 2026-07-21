@@ -1,20 +1,12 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <HTTPClient.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
+#include <time.h>
 #include <TFT_eSPI.h>
 #include <U8g2_for_TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <ArduinoJson.h>
 
 // ============ 用户配置区（可自定义修改） ============
-
-// WiFi配置
-const char* ssid = "ChinaNet-GWpJ";
-const char* password = "12345678";
 
 // 天气配置
 const char* WEATHER_CITY = "祥云县";        // 城市名称
@@ -38,15 +30,11 @@ XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 #define SCREEN_HEIGHT 240
 #define TFT_BL 21
 
-WiFiUDP ntpUDP;
-NTPClient* timeClient = nullptr;
-WiFiUDP lyricUDP;
-unsigned int lyric_port = 330;
-
 // 状态变量
 String currentLyric = "";
 String currentTranslation = "";
 uint16_t currentLyricColor = TFT_YELLOW;
+uint8_t currentLyricFontSize = 16;
 String currentTimeStr = "00:00:00";
 String lastTimeStr = ""; // 用于局部刷新的上一次时间
 String currentDateStr = "2024-01-01";
@@ -54,6 +42,10 @@ bool lyricActive = false;
 bool screenHidden = false;
 unsigned long lastLyricTime = 0;
 unsigned long lastTimeUpdate = 0;
+unsigned long lastTelemetryUpdate = 0;
+long desktopUtcOffsetSeconds = 8 * 3600;
+bool desktopTimeSynced = false;
+String desktopCommandBuffer = "";
 
 // CPU使用率计算
 unsigned long lastCpuUpdate = 0;
@@ -62,7 +54,7 @@ unsigned long activeTimeUs = 0;
 unsigned long lastLoopStart = 0;
 
 int currentPage = 0;
-#define MAX_PAGES 3
+#define MAX_PAGES 2
 
 // 天气数据结构
 struct WeatherData {
@@ -181,89 +173,6 @@ void drawTaskbar() {
     u8f.print(currentTimeStr);
 }
 
-// 天气API配置（使用Open-Meteo开源API，无需API key）
-const char* WEATHER_API_BASE = "https://api.open-meteo.com/v1/forecast";
-
-void fetchWeatherData() {
-    if (weatherLoading) return;
-    weatherLoading = true;
-    weatherError = "";
-
-    HTTPClient http;
-    // Open-Meteo API: 使用坐标获取天气
-    String url = String(WEATHER_API_BASE) +
-        "?latitude=" + String(weatherLat, 4) +
-        "&longitude=" + String(weatherLon, 4) +
-        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m" +
-        "&daily=weather_code,temperature_2m_max,temperature_2m_min" +
-        "&timezone=Asia/Shanghai" +
-        "&forecast_days=7";
-
-    Serial.println("Fetching weather: " + url);
-    http.begin(url);
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        DynamicJsonDocument doc(8192);
-        DeserializationError error = deserializeJson(doc, payload);
-
-        if (!error) {
-            // 解析当前天气
-            JsonObject current = doc["current"];
-            currentWeather.city = weatherCity;
-            currentWeather.temp = String(current["temperature_2m"].as<float>(), 1) + "°C";
-            currentWeather.feelsLike = String(current["apparent_temperature"].as<float>(), 1) + "°C";
-            currentWeather.humidity = String(current["relative_humidity_2m"].as<int>()) + "%";
-            currentWeather.windSpeed = String(current["wind_speed_10m"].as<float>(), 1) + " km/h";
-
-            int windDir = current["wind_direction_10m"].as<int>();
-            if (windDir < 22 || windDir >= 337) currentWeather.windDir = "北";
-            else if (windDir < 67) currentWeather.windDir = "东北";
-            else if (windDir < 112) currentWeather.windDir = "东";
-            else if (windDir < 157) currentWeather.windDir = "东南";
-            else if (windDir < 202) currentWeather.windDir = "南";
-            else if (windDir < 247) currentWeather.windDir = "西南";
-            else if (windDir < 292) currentWeather.windDir = "西";
-            else currentWeather.windDir = "西北";
-
-            int weatherCode = current["weather_code"].as<int>();
-            currentWeather.weather = wmoWeatherDesc(weatherCode);
-            currentWeather.icon = currentWeather.weather;
-            currentWeather.updateTime = currentDateStr + " " + currentTimeStr;
-            currentWeather.isValid = true;
-
-            // 解析未来7天预报
-            JsonObject daily = doc["daily"];
-            JsonArray timeArr = daily["time"];
-            JsonArray maxTempArr = daily["temperature_2m_max"];
-            JsonArray minTempArr = daily["temperature_2m_min"];
-            JsonArray weatherCodeArr = daily["weather_code"];
-
-            for (int i = 0; i < min(7, (int)timeArr.size()); i++) {
-                forecast[i].date = timeArr[i].as<String>();
-                forecast[i].high = String(maxTempArr[i].as<float>(), 1) + "°";
-                forecast[i].low = String(minTempArr[i].as<float>(), 1) + "°";
-                forecast[i].weather = wmoWeatherDesc(weatherCodeArr[i].as<int>());
-                forecast[i].icon = forecast[i].weather;
-            }
-
-            Serial.println("Weather updated successfully");
-        } else {
-            weatherError = "JSON解析失败";
-            currentWeather.isValid = false;
-        }
-    } else {
-        weatherError = "HTTP错误: " + String(httpCode);
-        currentWeather.isValid = false;
-    }
-
-    http.end();
-    weatherLoading = false;
-    // 无论成功失败都更新时间戳，避免频繁重试
-    lastWeatherUpdate = millis();
-}
-
 String formatUptime(unsigned long ms) {
     unsigned long seconds = ms / 1000;
     unsigned long days = seconds / 86400;
@@ -292,20 +201,6 @@ void drawInfoContent() {
         curY += lineHeight;
     };
 
-    // 网络状态
-    u8f.setForegroundColor(TFT_YELLOW);
-    u8f.setCursor(10, curY); u8f.print("--- 网络状态 ---"); curY += lineHeight;
-    drawRow("网络名称:", WiFi.SSID(), TFT_WHITE);
-    drawRow("IP 地址:", WiFi.localIP().toString(), TFT_GREEN);
-    drawRow("信号强度:", String(WiFi.RSSI()) + " dBm", TFT_WHITE);
-    drawRow("网关地址:", WiFi.gatewayIP().toString(), TFT_WHITE);
-    drawRow("MAC地址:", WiFi.macAddress(), TFT_WHITE);
-    drawRow("子网掩码:", WiFi.subnetMask().toString(), TFT_WHITE);
-    drawRow("DNS:", WiFi.dnsIP().toString(), TFT_WHITE);
-    drawRow("信道:", String(WiFi.channel()), TFT_WHITE);
-    drawRow("BSSID:", WiFi.BSSIDstr(), TFT_WHITE);
-
-    curY += 10;
     // 硬件信息
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 硬件信息 ---"); curY += lineHeight;
@@ -486,6 +381,14 @@ void drawDisplay() {
         if (lyricActive && currentLyric.length() > 0) {
             tft.fillScreen(TFT_BLACK);
             u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+            switch (currentLyricFontSize) {
+                case 12: u8f.setFont(u8g2_font_wqy12_t_gb2312); break;
+                case 13: u8f.setFont(u8g2_font_wqy13_t_gb2312); break;
+                case 14: u8f.setFont(u8g2_font_wqy14_t_gb2312); break;
+                case 15: u8f.setFont(u8g2_font_wqy15_t_gb2312); break;
+                default: u8f.setFont(u8g2_font_wqy16_t_gb2312); break;
+            }
+            u8f.setForegroundColor(currentLyricColor);
             int lyricLines = drawWrappedTextCentered(currentLyric, 160, 100, SCREEN_WIDTH - 20, 22);
             if (currentTranslation.length() > 0) {
                 u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
@@ -528,71 +431,137 @@ void drawDisplay() {
         tft.fillScreen(TFT_BLACK);
         drawInfoContent();
         drawTaskbar();
-    } else if (currentPage == 2) {
-        drawWeatherPage();
     }
 }
 
-void handleLyricPacket() {
-    int packetSize = lyricUDP.parsePacket();
-    if (packetSize > 0) {
-        char buffer[1024]; int len = lyricUDP.read(buffer, 1023);
-        if (len > 0) {
-            buffer[len] = '\0'; String data = String(buffer);
-            int seps[8]; int lastSep = -1; int sc = 0;
-            for(int i=0; i<8; i++) { int p = data.indexOf('|', lastSep+1); if(p == -1) break; seps[sc++] = p; lastSep = p; }
-            if (sc >= 8) {
-                currentLyricColor = hexTo565(data.substring(0, seps[0]));
-                String fullText = data.substring(seps[7] + 1);
-                int nIdx = fullText.indexOf('\n');
-                if (nIdx != -1) { currentLyric = fullText.substring(0, nIdx); currentTranslation = fullText.substring(nIdx+1); }
-                else { currentLyric = fullText; currentTranslation = ""; }
-                lyricActive = (currentLyric.length() > 0);
-                lastLyricTime = millis();
-                if (screenHidden) { screenHidden = false; digitalWrite(TFT_BL, HIGH); }
-                if (currentPage == 0) drawDisplay();
-            }
+void applyDesktopLyricPacket(const String& data) {
+    if (data.length() == 0 || data.length() > 1800) return;
+    int seps[8]; int lastSep = -1; int sc = 0;
+    for(int i=0; i<8; i++) { int p = data.indexOf('|', lastSep+1); if(p == -1) break; seps[sc++] = p; lastSep = p; }
+    if (sc >= 8) {
+        currentLyricColor = hexTo565(data.substring(0, seps[0]));
+        currentLyricFontSize = constrain(data.substring(seps[0] + 1, seps[1]).toInt(), 12, 16);
+        String fullText = data.substring(seps[7] + 1);
+        int nIdx = fullText.indexOf('\n');
+        if (nIdx != -1) { currentLyric = fullText.substring(0, nIdx); currentTranslation = fullText.substring(nIdx+1); }
+        else { currentLyric = fullText; currentTranslation = ""; }
+        lyricActive = (currentLyric.length() > 0);
+        lastLyricTime = millis();
+        if (screenHidden) { screenHidden = false; digitalWrite(TFT_BL, HIGH); }
+        if (currentPage == 0) drawDisplay();
+    }
+}
+
+void sendDesktopAck(const char* cmd, const char* message) {
+    StaticJsonDocument<192> doc;
+    doc["type"] = "ack";
+    doc["cmd"] = cmd;
+    doc["message"] = message;
+    serializeJson(doc, Serial);
+    Serial.println();
+}
+
+void sendDesktopTelemetry() {
+    DynamicJsonDocument doc(1536);
+    doc["type"] = "telemetry";
+    doc["chipModel"] = ESP.getChipModel();
+    doc["chipRevision"] = ESP.getChipRevision();
+    doc["chipCores"] = ESP.getChipCores();
+    doc["cpuMHz"] = ESP.getCpuFreqMHz();
+    doc["sdkVersion"] = ESP.getSdkVersion();
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["heapSize"] = ESP.getHeapSize();
+    doc["minFreeHeap"] = ESP.getMinFreeHeap();
+    doc["psramSize"] = ESP.getPsramSize();
+    doc["freePsram"] = ESP.getFreePsram();
+    doc["flashSize"] = ESP.getFlashChipSize();
+    doc["flashSpeed"] = ESP.getFlashChipSpeed();
+    doc["temperature"] = temperatureRead();
+    doc["uptimeSeconds"] = millis() / 1000;
+    doc["timeSynced"] = desktopTimeSynced;
+    doc["date"] = currentDateStr;
+    doc["time"] = currentTimeStr;
+    serializeJson(doc, Serial);
+    Serial.println();
+}
+
+void handleDesktopCommand(const String& line) {
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, line);
+    if (error) return;
+
+    const char* cmd = doc["cmd"] | "";
+    if (strcmp(cmd, "hello") == 0 || strcmp(cmd, "snapshot") == 0) {
+        sendDesktopAck(cmd, "ESP32 已响应");
+        sendDesktopTelemetry();
+    } else if (strcmp(cmd, "lyric_packet") == 0) {
+        applyDesktopLyricPacket(doc["payload"].as<String>());
+    } else if (strcmp(cmd, "time_sync") == 0) {
+        uint64_t epochMs = doc["epochMs"] | 0ULL;
+        desktopUtcOffsetSeconds = (doc["utcOffsetMinutes"] | 0) * 60L;
+        struct timeval tv = { static_cast<time_t>(epochMs / 1000ULL), static_cast<suseconds_t>((epochMs % 1000ULL) * 1000ULL) };
+        settimeofday(&tv, nullptr);
+        desktopTimeSynced = epochMs > 0;
+        sendDesktopAck(cmd, "电脑时间同步完成");
+    } else if (strcmp(cmd, "reboot") == 0) {
+        sendDesktopAck(cmd, "设备正在重启");
+        delay(150);
+        ESP.restart();
+    }
+}
+
+void readDesktopCommands() {
+    while (Serial.available()) {
+        char c = static_cast<char>(Serial.read());
+        if (c == '\n') {
+            desktopCommandBuffer.trim();
+            if (desktopCommandBuffer.length() > 0) handleDesktopCommand(desktopCommandBuffer);
+            desktopCommandBuffer = "";
+        } else if (c != '\r' && desktopCommandBuffer.length() < 2048) {
+            desktopCommandBuffer += c;
         }
     }
 }
 
+void updateTimeFromDesktopClock() {
+    if (!desktopTimeSynced) return;
+    time_t utcNow = time(nullptr);
+    time_t localNow = utcNow + desktopUtcOffsetSeconds;
+    struct tm current;
+    gmtime_r(&localNow, &current);
+    char timeBuffer[12];
+    char dateBuffer[20];
+    strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S", &current);
+    strftime(dateBuffer, sizeof(dateBuffer), "%Y-%m-%d", &current);
+    currentTimeStr = String(timeBuffer);
+    currentDateStr = String(dateBuffer);
+}
+
 void setup() {
+    Serial.begin(115200);
+    desktopCommandBuffer.reserve(2048);
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
     SPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI);
     touchscreen.begin(); touchscreen.setRotation(1);
     tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK); u8f.begin(tft);
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) delay(500);
-    timeClient = new NTPClient(ntpUDP, "ntp.aliyun.com", 8 * 3600, 60000);
-    timeClient->begin(); lyricUDP.begin(lyric_port);
-
-    // 首次获取天气数据
-    fetchWeatherData();
     drawDisplay();
+    sendDesktopTelemetry();
 }
 
 void loop() {
     unsigned long loopStart = micros();
 
-    handleLyricPacket();
-
+    readDesktopCommands();
     if (millis() - lastTimeUpdate >= 1000) {
-        timeClient->update();
-        currentTimeStr = timeClient->getFormattedTime();
-        unsigned long epochTime = timeClient->getEpochTime();
-        struct tm* ptm = gmtime((time_t*)&epochTime);
-        char dateBuffer[20]; sprintf(dateBuffer, "%04d-%02d-%02d", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
-        currentDateStr = String(dateBuffer);
-        // 天气页（currentPage == 2）不参与时间刷新
+        updateTimeFromDesktopClock();
         // 时间页（currentPage == 0）非歌词模式时刷新，或信息页（currentPage == 1）时刷新
         if ((currentPage == 0 && !lyricActive) || currentPage == 1) drawDisplay();
         lastTimeUpdate = millis();
     }
 
-    // 定期更新天气数据
-    if (millis() - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL) {
-        fetchWeatherData();
-        if (currentPage == 2) drawDisplay();
+    if (millis() - lastTelemetryUpdate >= 1000) {
+        sendDesktopTelemetry();
+        lastTelemetryUpdate = millis();
     }
 
     if (touchscreen.touched()) {
@@ -619,14 +588,6 @@ void loop() {
                     drawDisplay();
                     startY = p.y; // 更新起始点以平滑滚动
                     isSwiping = true; // 标记为滑动操作
-                }
-                else if (currentPage == 2 && abs(dy) > abs(dx) && abs(dy) > 200) {
-                    // 天气页纵向滑动：实时滚动
-                    weatherScrollOffset += dy / 20;
-                    weatherScrollOffset = constrain(weatherScrollOffset, -300, 0);
-                    drawDisplay();
-                    startY = p.y; // 更新起始点以平滑滚动
-                    isSwiping = true;
                 }
             }
         }
