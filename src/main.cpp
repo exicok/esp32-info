@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <time.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <esp_sntp.h>
 #include <TFT_eSPI.h>
 #include <U8g2_for_TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -9,9 +13,16 @@
 // ============ 用户配置区（可自定义修改） ============
 
 // 天气配置
-const char* WEATHER_CITY = "祥云县";        // 城市名称
-const float WEATHER_LAT = 25.48;            // 纬度
-const float WEATHER_LON = 100.56;           // 经度
+const char* WEATHER_CITY = "云南大理祥云";  // 显示名称
+const float WEATHER_LAT = 25.48;            // 祥云县纬度
+const float WEATHER_LON = 100.56;           // 祥云县经度
+
+// WiFi 与网络校时配置。SSID 留空时禁用 WiFi 校时。
+const char* WIFI_SSID = "ChinaNet-GWpJ";
+const char* WIFI_PASSWORD = "12345678";
+const char* NTP_SERVER_1 = "ntp.aliyun.com";
+const char* NTP_SERVER_2 = "pool.ntp.org";
+const long LOCAL_UTC_OFFSET_SECONDS = 8 * 3600;
 
 // ============ 配置区结束 ============
 
@@ -35,17 +46,33 @@ String currentLyric = "";
 String currentTranslation = "";
 uint16_t currentLyricColor = TFT_YELLOW;
 uint8_t currentLyricFontSize = 16;
+bool musicIsPlaying = false;
+float musicProgressSeconds = 0;
+float musicDurationSeconds = 0;
+unsigned long musicProgressUpdatedAt = 0;
+unsigned long lastMusicProgressDraw = 0;
 String currentTimeStr = "00:00:00";
 String lastTimeStr = ""; // 用于局部刷新的上一次时间
 String currentDateStr = "2024-01-01";
 bool lyricActive = false;
 bool screenHidden = false;
+unsigned long lastInteractionMillis = 0;
+const unsigned long SCREEN_IDLE_TIMEOUT = 300000UL; // 5分钟
 unsigned long lastLyricTime = 0;
 unsigned long lastTimeUpdate = 0;
 unsigned long lastTelemetryUpdate = 0;
-long desktopUtcOffsetSeconds = 8 * 3600;
+long desktopUtcOffsetSeconds = LOCAL_UTC_OFFSET_SECONDS;
 bool desktopTimeSynced = false;
+bool wifiTimeSynced = false;
+bool wifiNtpStarted = false;
+volatile bool wifiNtpSyncPending = false;
+unsigned long lastWifiConnectAttempt = 0;
 String desktopCommandBuffer = "";
+
+enum class TimeSource { NONE, DESKTOP, WIFI_NTP };
+TimeSource activeTimeSource = TimeSource::NONE;
+
+const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
 
 // CPU使用率计算
 unsigned long lastCpuUpdate = 0;
@@ -54,7 +81,7 @@ unsigned long activeTimeUs = 0;
 unsigned long lastLoopStart = 0;
 
 int currentPage = 0;
-#define MAX_PAGES 2
+#define MAX_PAGES 3
 
 // 天气数据结构
 struct WeatherData {
@@ -81,7 +108,9 @@ struct ForecastData {
 WeatherData currentWeather = {"", "", "", "", "", "", "", "", "", false};
 ForecastData forecast[7];
 unsigned long lastWeatherUpdate = 0;
+unsigned long lastWeatherAttempt = 0;
 const unsigned long WEATHER_UPDATE_INTERVAL = 1800000; // 30分钟更新一次
+const unsigned long WEATHER_RETRY_INTERVAL = 60000;     // 失败后1分钟重试
 bool weatherLoading = false;
 String weatherError = "";
 String weatherCity = WEATHER_CITY; // 使用配置区的城市名称
@@ -186,22 +215,34 @@ String formatUptime(unsigned long ms) {
     return String(buf);
 }
 
-void drawInfoContent() {
+void drawInfoContent(bool forceRefresh) {
+    static String rowCache[24];
+    int rowIndex = 0;
     int curY = 50 + scrollOffset;
     int lineHeight = 25;
     u8f.setFont(u8g2_font_wqy12_t_gb2312);
 
     auto drawRow = [&](const char* label, String val, uint16_t color) {
-        if (curY > 24 && curY < SCREEN_HEIGHT + 20) {
+        bool changed = forceRefresh || rowCache[rowIndex] != val;
+        if (changed && curY > 24 && curY < SCREEN_HEIGHT + 20) {
+            tft.fillRect(0, curY - 16, SCREEN_WIDTH, 20, TFT_BLACK);
             u8f.setForegroundColor(TFT_CYAN);
             u8f.setCursor(10, curY); u8f.print(label);
             u8f.setForegroundColor(color);
             u8f.setCursor(100, curY); u8f.print(val);
         }
+        rowCache[rowIndex++] = val;
         curY += lineHeight;
     };
 
+    auto drawCard = [&](int top, int height) {
+        if (top < SCREEN_HEIGHT && top + height > 24) {
+            tft.drawRoundRect(4, top, SCREEN_WIDTH - 8, height, 6, tft.color565(55, 65, 78));
+        }
+    };
+
     // 硬件信息
+    drawCard(curY - 18, 151);
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 硬件信息 ---"); curY += lineHeight;
     drawRow("CPU 频率:", String(ESP.getCpuFreqMHz()) + " MHz", TFT_WHITE);
@@ -212,6 +253,7 @@ void drawInfoContent() {
 
     curY += 10;
     // 内存信息
+    drawCard(curY - 18, psramFound() ? 151 : 101);
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 内存信息 ---"); curY += lineHeight;
     drawRow("可用堆内存:", String(ESP.getFreeHeap() / 1024) + " KB", TFT_GREEN);
@@ -224,19 +266,126 @@ void drawInfoContent() {
 
     curY += 10;
     // ROM/Flash信息
+    drawCard(curY - 18, 76);
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- ROM/Flash ---"); curY += lineHeight;
     drawRow("Flash大小:", String(ESP.getFlashChipSize() / 1024 / 1024) + " MB", TFT_WHITE);
     drawRow("Flash速度:", String(ESP.getFlashChipSpeed() / 1000000) + " MHz", TFT_WHITE);
 
     curY += 10;
+    // WiFi 信息
+    drawCard(curY - 18, 151);
+    bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    u8f.setForegroundColor(TFT_YELLOW);
+    u8f.setCursor(10, curY); u8f.print("--- WiFi 信息 ---"); curY += lineHeight;
+    drawRow("连接状态:", wifiConnected ? "已连接" : "未连接", wifiConnected ? TFT_GREEN : TFT_RED);
+    String wifiSsid = wifiConnected ? WiFi.SSID() : String(WIFI_SSID);
+    if (wifiSsid.length() == 0) wifiSsid = "未配置";
+    if (wifiSsid.length() > 28) wifiSsid = wifiSsid.substring(0, 25) + "...";
+    drawRow("SSID:", wifiSsid, TFT_WHITE);
+    drawRow("IP地址:", wifiConnected ? WiFi.localIP().toString() : "--", TFT_WHITE);
+    drawRow("信号强度:", wifiConnected ? String(WiFi.RSSI()) + " dBm" : "--", wifiConnected ? TFT_CYAN : TFT_WHITE);
+    drawRow("MAC地址:", WiFi.macAddress(), TFT_WHITE);
+
+    curY += 10;
     // 系统状态
+    drawCard(curY - 18, 101);
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 系统状态 ---"); curY += lineHeight;
     char cpuBuf[16];
     sprintf(cpuBuf, "%.1f%%", cpuUsagePercent);
     drawRow("CPU占有率:", cpuBuf, TFT_CYAN);
     drawRow("开机时间:", formatUptime(millis()), TFT_WHITE);
+}
+
+void drawWeatherPage();
+
+String windDirectionDesc(float degrees) {
+    static const char* directions[] = {"北", "东北", "东", "东南", "南", "西南", "西", "西北"};
+    int index = static_cast<int>((degrees + 22.5f) / 45.0f) % 8;
+    return directions[index];
+}
+
+bool fetchWeather() {
+    if (WiFi.status() != WL_CONNECTED || weatherLoading) return false;
+
+    weatherLoading = true;
+    weatherError = "";
+    lastWeatherAttempt = millis();
+    if (currentPage == 2) drawWeatherPage();
+
+    // Open-Meteo 国际免费天气接口，无需 API Key。
+    String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(weatherLat, 4)
+        + "&longitude=" + String(weatherLon, 4)
+        + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m"
+        + "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+        + "&timezone=Asia%2FShanghai&forecast_days=7";
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(10000);
+    if (!http.begin(client, url)) {
+        weatherError = "无法连接天气服务";
+        weatherLoading = false;
+        return false;
+    }
+
+    int statusCode = http.GET();
+    if (statusCode != HTTP_CODE_OK) {
+        weatherError = "请求失败: " + String(statusCode);
+        http.end();
+        weatherLoading = false;
+        return false;
+    }
+
+    String responseBody = http.getString();
+    http.end();
+    DynamicJsonDocument doc(16384);
+    DeserializationError error = deserializeJson(doc, responseBody);
+    if (error) {
+        weatherError = "天气数据解析失败: " + String(error.c_str());
+        weatherLoading = false;
+        return false;
+    }
+
+    JsonObject current = doc["current"];
+    currentWeather.city = WEATHER_CITY;
+    currentWeather.temp = String(current["temperature_2m"].as<float>(), 1) + "°C";
+    currentWeather.feelsLike = String(current["apparent_temperature"].as<float>(), 1) + "°C";
+    currentWeather.humidity = String(current["relative_humidity_2m"].as<int>()) + "%";
+    currentWeather.windSpeed = String(current["wind_speed_10m"].as<float>(), 1) + " km/h";
+    currentWeather.windDir = windDirectionDesc(current["wind_direction_10m"].as<float>());
+    currentWeather.weather = wmoWeatherDesc(current["weather_code"].as<int>());
+    currentWeather.updateTime = current["time"].as<String>();
+
+    JsonObject daily = doc["daily"];
+    if (daily.isNull()) {
+        weatherError = "天气接口未返回预报";
+        weatherLoading = false;
+        return false;
+    }
+
+    for (int i = 0; i < 7; ++i) {
+        if (i >= daily.size()) {
+            forecast[i] = {"", "", "", "", ""};
+            continue;
+        }
+        forecast[i].date = daily["time"][i].as<String>();
+        forecast[i].high = String(daily["temperature_2m_max"][i].as<float>(), 0) + "°";
+        forecast[i].low = String(daily["temperature_2m_min"][i].as<float>(), 0) + "°";
+        forecast[i].weather = wmoWeatherDesc(daily["weather_code"][i].as<int>());
+    }
+
+    currentWeather.isValid = true;
+    weatherLoading = false;
+    lastWeatherUpdate = millis();
+    return true;
+}
+
+void refreshInfoPage() {
+    drawInfoContent(false);
+    drawTaskbar();
 }
 
 void drawWeatherPage() {
@@ -283,7 +432,7 @@ void drawWeatherPage() {
         u8f.setForegroundColor(TFT_WHITE);
         u8f.setFont(u8g2_font_logisoso32_tn);
         // 提取温度数字部分（去掉°C）
-        String tempNum = currentWeather.feelsLike;
+        String tempNum = currentWeather.temp;
         int degreeIdx = tempNum.indexOf("°");
         if (degreeIdx > 0) tempNum = tempNum.substring(0, degreeIdx);
         int tempWidth = u8f.getUTF8Width(tempNum.c_str());
@@ -376,6 +525,50 @@ void drawWeatherPage() {
     }
 }
 
+void drawMusicControls() {
+    struct ControlButton { int x; const char* label; };
+    const ControlButton buttons[] = {{55, "|<"}, {135, musicIsPlaying ? "||" : ">"}, {215, ">|"}};
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    for (const auto& button : buttons) {
+        tft.fillRoundRect(button.x, 194, 50, 36, 4, tft.color565(38, 45, 54));
+        tft.drawRoundRect(button.x, 194, 50, 36, 4, tft.color565(90, 105, 120));
+        tft.setTextColor(TFT_WHITE, tft.color565(38, 45, 54));
+        tft.drawString(button.label, button.x + 25, 212);
+    }
+}
+
+void drawMusicProgress() {
+    if (!lyricActive || musicDurationSeconds <= 0) return;
+    float progress = musicProgressSeconds;
+    if (musicIsPlaying) progress += (millis() - musicProgressUpdatedAt) / 1000.0f;
+    progress = constrain(progress / musicDurationSeconds, 0.0f, 1.0f);
+    const int x = 20, y = 178, width = 280, height = 4;
+    tft.fillRect(x, y, width, height, tft.color565(55, 60, 68));
+    tft.fillRect(x, y, static_cast<int>(width * progress), height, TFT_CYAN);
+}
+
+bool sendMusicControl(const char* action) {
+    StaticJsonDocument<96> doc;
+    doc["type"] = "music_control";
+    doc["action"] = action;
+    serializeJson(doc, Serial);
+    Serial.println();
+    return true;
+}
+
+bool handleMusicControlTap(int rawX, int rawY) {
+    if (!lyricActive || currentPage != 0) return false;
+    int screenX = constrain(map(rawX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
+    int screenY = constrain(map(rawY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+    if (screenY < 188 || screenY > 239) return false;
+
+    if (screenX >= 45 && screenX <= 115) return sendMusicControl("previous");
+    if (screenX >= 125 && screenX <= 195) return sendMusicControl("play-pause");
+    if (screenX >= 205 && screenX <= 275) return sendMusicControl("next");
+    return false;
+}
+
 void drawDisplay() {
     if (currentPage == 0) {
         if (lyricActive && currentLyric.length() > 0) {
@@ -389,17 +582,19 @@ void drawDisplay() {
                 default: u8f.setFont(u8g2_font_wqy16_t_gb2312); break;
             }
             u8f.setForegroundColor(currentLyricColor);
-            int lyricLines = drawWrappedTextCentered(currentLyric, 160, 100, SCREEN_WIDTH - 20, 22);
+            int lyricLines = drawWrappedTextCentered(currentLyric, 160, 70, SCREEN_WIDTH - 20, 20);
             if (currentTranslation.length() > 0) {
                 u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
-                drawWrappedTextCentered(currentTranslation, 160, 100 + lyricLines * 22 + 8, SCREEN_WIDTH - 20, 18);
+                drawWrappedTextCentered(currentTranslation, 160, 70 + lyricLines * 20 + 8, SCREEN_WIDTH - 20, 18);
             }
+            drawMusicProgress();
+            drawMusicControls();
             lastTimeStr = ""; // 重置，下次显示时间时全量绘制
         } else {
             // 时间显示 - 局部刷新
             tft.setTextSize(5);
             tft.setTextDatum(CC_DATUM);
-            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextColor(TFT_WHITE);
             
             // 计算时间字符串的宽度和每个字符的位置
             int charWidth = tft.textWidth("0"); // 单个数字的宽度
@@ -408,10 +603,11 @@ void drawDisplay() {
             int y = 120;
             
             if (lastTimeStr.length() != currentTimeStr.length()) {
-                // 首次显示或格式变化，全量绘制
                 tft.fillScreen(TFT_BLACK);
+                tft.setTextColor(TFT_WHITE, TFT_BLACK);
                 tft.drawString(currentTimeStr, 160, y);
             } else {
+                tft.setTextColor(TFT_WHITE, TFT_BLACK);
                 // 逐字符比较，只重绘变化的字符
                 for (int i = 0; i < currentTimeStr.length(); i++) {
                     if (currentTimeStr[i] != lastTimeStr[i]) {
@@ -429,8 +625,10 @@ void drawDisplay() {
         }
     } else if (currentPage == 1) {
         tft.fillScreen(TFT_BLACK);
-        drawInfoContent();
+        drawInfoContent(true);
         drawTaskbar();
+    } else if (currentPage == 2) {
+        drawWeatherPage();
     }
 }
 
@@ -441,13 +639,16 @@ void applyDesktopLyricPacket(const String& data) {
     if (sc >= 8) {
         currentLyricColor = hexTo565(data.substring(0, seps[0]));
         currentLyricFontSize = constrain(data.substring(seps[0] + 1, seps[1]).toInt(), 12, 16);
+        musicProgressSeconds = data.substring(seps[1] + 1, seps[2]).toFloat();
+        musicDurationSeconds = data.substring(seps[2] + 1, seps[3]).toFloat();
+        musicIsPlaying = data.substring(seps[3] + 1, seps[4]).toInt() == 1;
+        musicProgressUpdatedAt = millis();
         String fullText = data.substring(seps[7] + 1);
         int nIdx = fullText.indexOf('\n');
         if (nIdx != -1) { currentLyric = fullText.substring(0, nIdx); currentTranslation = fullText.substring(nIdx+1); }
         else { currentLyric = fullText; currentTranslation = ""; }
         lyricActive = (currentLyric.length() > 0);
         lastLyricTime = millis();
-        if (screenHidden) { screenHidden = false; digitalWrite(TFT_BL, HIGH); }
         if (currentPage == 0) drawDisplay();
     }
 }
@@ -478,7 +679,12 @@ void sendDesktopTelemetry() {
     doc["flashSpeed"] = ESP.getFlashChipSpeed();
     doc["temperature"] = temperatureRead();
     doc["uptimeSeconds"] = millis() / 1000;
-    doc["timeSynced"] = desktopTimeSynced;
+    doc["timeSynced"] = desktopTimeSynced || wifiTimeSynced;
+    doc["timeSource"] = activeTimeSource == TimeSource::WIFI_NTP
+        ? "wifi-ntp"
+        : (activeTimeSource == TimeSource::DESKTOP ? "ntp-via-com" : "unsynced");
+    doc["wifiConnected"] = WiFi.status() == WL_CONNECTED;
+    doc["wifiRssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
     doc["date"] = currentDateStr;
     doc["time"] = currentTimeStr;
     serializeJson(doc, Serial);
@@ -502,7 +708,12 @@ void handleDesktopCommand(const String& line) {
         struct timeval tv = { static_cast<time_t>(epochMs / 1000ULL), static_cast<suseconds_t>((epochMs % 1000ULL) * 1000ULL) };
         settimeofday(&tv, nullptr);
         desktopTimeSynced = epochMs > 0;
-        sendDesktopAck(cmd, "电脑时间同步完成");
+        if (desktopTimeSynced) activeTimeSource = TimeSource::DESKTOP;
+        sendDesktopAck(cmd, doc["source"] == "ntp" ? "NTP 时间经 COM 同步完成" : "电脑时间同步完成");
+    } else if (strcmp(cmd, "screen_off") == 0) {
+        screenHidden = true;
+        digitalWrite(TFT_BL, LOW);
+        sendDesktopAck(cmd, "屏幕已关闭，点击屏幕唤醒");
     } else if (strcmp(cmd, "reboot") == 0) {
         sendDesktopAck(cmd, "设备正在重启");
         delay(150);
@@ -523,10 +734,51 @@ void readDesktopCommands() {
     }
 }
 
-void updateTimeFromDesktopClock() {
-    if (!desktopTimeSynced) return;
+void onWifiNtpSync(struct timeval*) {
+    wifiNtpSyncPending = true;
+}
+
+void startWifiConnection() {
+    if (strlen(WIFI_SSID) == 0) return;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    lastWifiConnectAttempt = millis();
+}
+
+void maintainWifiTimeSync() {
+    if (strlen(WIFI_SSID) == 0) return;
+
+    if (WiFi.status() != WL_CONNECTED) {
+        wifiNtpStarted = false;
+        if (millis() - lastWifiConnectAttempt >= WIFI_RECONNECT_INTERVAL) {
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            lastWifiConnectAttempt = millis();
+        }
+        return;
+    }
+
+    if (!wifiNtpStarted) {
+        sntp_set_time_sync_notification_cb(onWifiNtpSync);
+        configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+        wifiNtpStarted = true;
+    }
+
+    if (wifiNtpSyncPending) {
+        wifiNtpSyncPending = false;
+        wifiTimeSynced = true;
+        activeTimeSource = TimeSource::WIFI_NTP;
+    }
+}
+
+void updateTimeFromSystemClock() {
+    if (!desktopTimeSynced && !wifiTimeSynced) return;
     time_t utcNow = time(nullptr);
-    time_t localNow = utcNow + desktopUtcOffsetSeconds;
+    long utcOffsetSeconds = activeTimeSource == TimeSource::DESKTOP
+        ? desktopUtcOffsetSeconds
+        : LOCAL_UTC_OFFSET_SECONDS;
+    time_t localNow = utcNow + utcOffsetSeconds;
     struct tm current;
     gmtime_r(&localNow, &current);
     char timeBuffer[12];
@@ -544,6 +796,8 @@ void setup() {
     SPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI);
     touchscreen.begin(); touchscreen.setRotation(1);
     tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK); u8f.begin(tft);
+    lastInteractionMillis = millis();
+    startWifiConnection();
     drawDisplay();
     sendDesktopTelemetry();
 }
@@ -552,10 +806,23 @@ void loop() {
     unsigned long loopStart = micros();
 
     readDesktopCommands();
+    maintainWifiTimeSync();
+    if (WiFi.status() == WL_CONNECTED) {
+        bool updateDue = currentWeather.isValid
+            ? millis() - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL
+            : millis() - lastWeatherAttempt >= WEATHER_RETRY_INTERVAL || lastWeatherAttempt == 0;
+        if (updateDue) {
+            fetchWeather();
+            if (currentPage == 2) drawWeatherPage();
+        }
+    }
     if (millis() - lastTimeUpdate >= 1000) {
-        updateTimeFromDesktopClock();
-        // 时间页（currentPage == 0）非歌词模式时刷新，或信息页（currentPage == 1）时刷新
-        if ((currentPage == 0 && !lyricActive) || currentPage == 1) drawDisplay();
+        if (!lyricActive) updateTimeFromSystemClock();
+        if (currentPage == 0 && !lyricActive) {
+            drawDisplay();
+        } else if (currentPage == 1) {
+            refreshInfoPage();
+        }
         lastTimeUpdate = millis();
     }
 
@@ -564,8 +831,20 @@ void loop() {
         lastTelemetryUpdate = millis();
     }
 
+    if (!screenHidden && millis() - lastInteractionMillis >= SCREEN_IDLE_TIMEOUT) {
+        screenHidden = true;
+        digitalWrite(TFT_BL, LOW);
+    }
+
+    if (currentPage == 0 && lyricActive && musicDurationSeconds > 0
+        && millis() - lastMusicProgressDraw >= 500) {
+        drawMusicProgress();
+        lastMusicProgressDraw = millis();
+    }
+
     if (touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();
+        lastInteractionMillis = millis();
         // 保存有效的触摸坐标
         lastTouchX = p.x;
         lastTouchY = p.y;
@@ -588,6 +867,12 @@ void loop() {
                     drawDisplay();
                     startY = p.y; // 更新起始点以平滑滚动
                     isSwiping = true; // 标记为滑动操作
+                } else if (currentPage == 2 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                    weatherScrollOffset += dy / 20;
+                    weatherScrollOffset = constrain(weatherScrollOffset, -300, 0);
+                    drawDisplay();
+                    startY = p.y;
+                    isSwiping = true;
                 }
             }
         }
@@ -601,8 +886,9 @@ void loop() {
 
             // 只有当不是滑动操作时才处理点击
             if (!isSwiping) {
-                // 其他页面的横向滑动切换
-                if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
+                if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
+                    // 音乐控制点击已处理
+                } else if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
                     currentPage = (currentPage - 1 + MAX_PAGES) % MAX_PAGES;
                     scrollOffset = 0;
                     weatherScrollOffset = 0;
