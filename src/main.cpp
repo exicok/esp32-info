@@ -60,6 +60,7 @@ unsigned long lastInteractionMillis = 0;
 const unsigned long SCREEN_IDLE_TIMEOUT = 300000UL; // 5分钟
 unsigned long lastLyricTime = 0;
 unsigned long lastTimeUpdate = 0;
+unsigned long lastInfoUpdate = 0;
 unsigned long lastTelemetryUpdate = 0;
 long desktopUtcOffsetSeconds = LOCAL_UTC_OFFSET_SECONDS;
 bool desktopTimeSynced = false;
@@ -80,20 +81,38 @@ float cpuUsagePercent = 0;
 unsigned long activeTimeUs = 0;
 unsigned long lastLoopStart = 0;
 
+String pcCpuName = "等待电脑数据";
+String pcGpuName = "等待电脑数据";
+float pcCpuUsage = 0;
+int pcCpuCores = 0;
+int pcMemoryUsedMB = 0;
+int pcMemoryTotalMB = 0;
+int pcGpuMemoryMB = 0;
+int pcCpuPhysicalCores = 0;
+int pcCpuMaxMHz = 0;
+float pcMemoryUsage = 0;
+String pcGpuDriver = "";
+String pcDiskSummary = "等待磁盘数据";
+int pcScrollOffset = 0;
+bool pcStatusDirty = false;
+unsigned long lastPcStatusDraw = 0;
+float pcCpuHistory[36] = {0};
+float pcGpuHistory[36] = {0};
+float pcGpuUsage = 0;
+
 int currentPage = 0;
-#define MAX_PAGES 3
+#define MAX_PAGES 7
 
 // 天气数据结构
 struct WeatherData {
     String city;
     String temp;
-    String feelsLike;
     String humidity;
     String windSpeed;
     String windDir;
     String weather;
-    String icon;
-    String updateTime;
+    float windSpeedKmh;
+    float windDirectionDegrees;
     bool isValid;
 };
 
@@ -102,18 +121,110 @@ struct ForecastData {
     String high;
     String low;
     String weather;
-    String icon;
 };
 
-WeatherData currentWeather = {"", "", "", "", "", "", "", "", "", false};
+WeatherData currentWeather = {"", "", "", "", "", "", 0.0f, 0.0f, false};
 ForecastData forecast[7];
 unsigned long lastWeatherUpdate = 0;
 unsigned long lastWeatherAttempt = 0;
+unsigned long lastWindAnimation = 0;
+uint8_t windAnimationPhase = 0;
 const unsigned long WEATHER_UPDATE_INTERVAL = 1800000; // 30分钟更新一次
 const unsigned long WEATHER_RETRY_INTERVAL = 60000;     // 失败后1分钟重试
 bool weatherLoading = false;
 String weatherError = "";
 String weatherCity = WEATHER_CITY; // 使用配置区的城市名称
+
+struct NewsItem { String title; String body; String source; };
+NewsItem newsItems[30];
+int newsCount = 0;
+bool newsValid = false;
+bool newsDetail = false;
+int newsDetailIndex = -1;
+int newsScrollOffset = 0;
+int newsDetailScrollOffset = 0;
+bool timerCountdownMode = false;
+bool timerRunning = false;
+unsigned long timerStartedAt = 0;
+unsigned long timerElapsedMs = 0;
+unsigned long countdownDurationMs = 300000UL;
+unsigned long lastTimerDraw = 0;
+bool timerAlarmActive = false;
+bool timerAlarmRed = false;
+unsigned long lastTimerAlarmToggle = 0;
+unsigned long lastNewsUpdate = 0;
+
+int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int lineHeight);
+
+String xmlValue(const String& xml, const char* tag, int from) {
+    String open = String("<") + tag + ">", close = String("</") + tag + ">";
+    int a = xml.indexOf(open, from), b;
+    if (a < 0) return "";
+    a += open.length(); b = xml.indexOf(close, a);
+    if (b < 0) return "";
+    String value = xml.substring(a, b); value.replace("&amp;", "&"); value.replace("&quot;", "\"");
+    return value;
+}
+
+bool fetchNews() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    WiFiClientSecure client; client.setInsecure(); HTTPClient http;
+    const char* feeds[] = {
+        "https://www.chinanews.com.cn/rss/scroll-news.xml",
+        "https://www.chinanews.com.cn/rss/china.xml",
+        "https://www.chinanews.com.cn/rss/world.xml"
+    };
+    newsCount = 0;
+    for (const char* feed : feeds) {
+        if (newsCount >= 30 || !http.begin(client, feed)) continue;
+        http.setTimeout(10000);
+        if (http.GET() == HTTP_CODE_OK) {
+            String xml = http.getString(); int pos = 0;
+            while (newsCount < 30) {
+                int item = xml.indexOf("<item>", pos); if (item < 0) break;
+                String title = xmlValue(xml, "title", item);
+                if (title.length()) {
+                    String body = xmlValue(xml, "description", item);
+                    if (body.length() == 0) body = xmlValue(xml, "content:encoded", item);
+                    body.replace("<![CDATA[", ""); body.replace("]]>", "");
+                    newsItems[newsCount].title = title;
+                    newsItems[newsCount].body = body;
+                    newsItems[newsCount].source = feed;
+                    newsCount++;
+                }
+                pos = item + 6;
+            }
+        }
+        http.end();
+    }
+    newsValid = newsCount > 0; lastNewsUpdate = millis();
+    return newsValid;
+}
+
+void drawNewsPage() {
+    tft.fillScreen(TFT_BLACK); u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    if (newsDetail && newsDetailIndex >= 0 && newsDetailIndex < newsCount) {
+        u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(8, 22); u8f.print("< 返回");
+        u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_WHITE);
+        int titleLines = drawWrappedTextCentered(newsItems[newsDetailIndex].title, 160, 52, 300, 18);
+        u8f.setForegroundColor(TFT_LIGHTGREY);
+        String body = newsItems[newsDetailIndex].body;
+        if (body.length() == 0) body = "暂无正文摘要";
+        drawWrappedTextCentered(body, 160, 58 + titleLines * 18 + newsDetailScrollOffset, 300, 16);
+        u8f.setForegroundColor(TFT_DARKGREY); u8f.setCursor(10, 220); u8f.print("来源: " + newsItems[newsDetailIndex].source);
+        return;
+    }
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
+    u8f.setCursor(12, 24); u8f.print("新闻");
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    if (!newsValid) { u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(20, 70); u8f.print("新闻加载中..."); return; }
+    for (int i = 0; i < newsCount; ++i) {
+        int y = 52 + i * 30 + newsScrollOffset;
+        if (y < 30 || y > SCREEN_HEIGHT + 20) continue;
+        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(10, y); u8f.print(String(i + 1) + ".");
+        u8f.setForegroundColor(TFT_WHITE); drawWrappedTextCentered(newsItems[i].title, 175, y, 275, 16);
+    }
+}
 
 // 祥云县坐标（使用配置区）
 float weatherLat = WEATHER_LAT;
@@ -148,7 +259,6 @@ bool isSwiping = false; // 标记是否为滑动操作
 int scrollOffset = 0;
 int weatherScrollOffset = 0; // 天气页面专用滚动偏移
 const int SWIPE_MIN_X = 800; // 左右滑动触发阈值 (原始坐标)
-const int SWIPE_MIN_Y = 300; // 上下滑动触发阈值 (用于翻页)
 
 uint16_t hexTo565(String hex) {
     if (hex.startsWith("#")) hex = hex.substring(1);
@@ -317,7 +427,7 @@ bool fetchWeather() {
     // Open-Meteo 国际免费天气接口，无需 API Key。
     String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(weatherLat, 4)
         + "&longitude=" + String(weatherLon, 4)
-        + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m"
+        + "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m"
         + "&daily=weather_code,temperature_2m_max,temperature_2m_min"
         + "&timezone=Asia%2FShanghai&forecast_days=7";
 
@@ -352,12 +462,12 @@ bool fetchWeather() {
     JsonObject current = doc["current"];
     currentWeather.city = WEATHER_CITY;
     currentWeather.temp = String(current["temperature_2m"].as<float>(), 1) + "°C";
-    currentWeather.feelsLike = String(current["apparent_temperature"].as<float>(), 1) + "°C";
     currentWeather.humidity = String(current["relative_humidity_2m"].as<int>()) + "%";
     currentWeather.windSpeed = String(current["wind_speed_10m"].as<float>(), 1) + " km/h";
-    currentWeather.windDir = windDirectionDesc(current["wind_direction_10m"].as<float>());
+    currentWeather.windSpeedKmh = current["wind_speed_10m"].as<float>();
+    currentWeather.windDirectionDegrees = current["wind_direction_10m"].as<float>();
+    currentWeather.windDir = windDirectionDesc(currentWeather.windDirectionDegrees);
     currentWeather.weather = wmoWeatherDesc(current["weather_code"].as<int>());
-    currentWeather.updateTime = current["time"].as<String>();
 
     JsonObject daily = doc["daily"];
     if (daily.isNull()) {
@@ -368,7 +478,7 @@ bool fetchWeather() {
 
     for (int i = 0; i < 7; ++i) {
         if (i >= daily.size()) {
-            forecast[i] = {"", "", "", "", ""};
+            forecast[i] = {"", "", "", ""};
             continue;
         }
         forecast[i].date = daily["time"][i].as<String>();
@@ -386,6 +496,26 @@ bool fetchWeather() {
 void refreshInfoPage() {
     drawInfoContent(false);
     drawTaskbar();
+}
+
+void drawWindAnimation() {
+    if (!currentWeather.isValid) return;
+    int cy = 117 + weatherScrollOffset;
+    if (cy < 24 || cy >= SCREEN_HEIGHT) return;
+    tft.fillRect(252, cy - 20, 68, 44, TFT_BLACK);
+    int cx = 300, radius = 14;
+    tft.drawCircle(cx, cy, radius, tft.color565(55, 65, 78));
+    float radians = (currentWeather.windDirectionDegrees - 90.0f) * PI / 180.0f;
+    int tipX = cx + static_cast<int>(cos(radians) * radius);
+    int tipY = cy + static_cast<int>(sin(radians) * radius);
+    tft.drawLine(cx, cy, tipX, tipY, TFT_CYAN);
+    float left = radians + 2.65f, right = radians - 2.65f;
+    tft.drawLine(tipX, tipY, tipX + static_cast<int>(cos(left) * 6), tipY + static_cast<int>(sin(left) * 6), TFT_CYAN);
+    tft.drawLine(tipX, tipY, tipX + static_cast<int>(cos(right) * 6), tipY + static_cast<int>(sin(right) * 6), TFT_CYAN);
+    for (int i = 0; i < 3; ++i) {
+        int offset = (windAnimationPhase + i * 9) % 27;
+        tft.drawFastHLine(258 + offset, cy - 10 + i * 9, 7, tft.color565(80, 180, 220));
+    }
 }
 
 void drawWeatherPage() {
@@ -465,6 +595,7 @@ void drawWeatherPage() {
         u8f.setCursor(180, y);
         u8f.print("风向: " + currentWeather.windDir);
     }
+    drawWindAnimation();
     y += 18;
     if (y > 24 && y < SCREEN_HEIGHT) {
         u8f.setCursor(30, y);
@@ -569,6 +700,131 @@ bool handleMusicControlTap(int rawX, int rawY) {
     return false;
 }
 
+String holidayName(int month, int day) {
+    if (month == 1 && day == 1) return "元旦";
+    if (month == 5 && day == 1) return "劳动节";
+    if (month == 10 && day == 1) return "国庆节";
+    // 2026 年主要农历节日。
+    if (month == 2 && day == 17) return "春节";
+    if (month == 6 && day == 19) return "端午";
+    if (month == 9 && day == 25) return "中秋";
+    return "";
+}
+
+bool isHolidayBreak2026(int month, int day) {
+    return (month == 1 && day >= 1 && day <= 3)
+        || (month == 2 && day >= 15 && day <= 23)
+        || (month == 4 && day >= 4 && day <= 6)
+        || (month == 5 && day >= 1 && day <= 5)
+        || (month == 6 && day >= 19 && day <= 21)
+        || (month == 9 && day >= 25 && day <= 27)
+        || (month == 10 && day >= 1 && day <= 7);
+}
+
+bool isMakeupWorkday2026(int month, int day) {
+    return (month == 1 && day == 4) || (month == 2 && (day == 14 || day == 28))
+        || (month == 4 && day == 26) || (month == 5 && day == 9)
+        || (month == 9 && day == 20) || (month == 10 && day == 10);
+}
+
+void drawCalendarPage() {
+    tft.fillScreen(TFT_BLACK); u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    int year = currentDateStr.substring(0, 4).toInt();
+    int month = currentDateStr.substring(5, 7).toInt();
+    int today = currentDateStr.substring(8, 10).toInt();
+    if (year < 2024 || month < 1) { year = 2026; month = 1; today = 1; }
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
+    String title = String(year) + " 年 " + String(month) + " 月";
+    u8f.setCursor(160 - u8f.getUTF8Width(title.c_str()) / 2, 22); u8f.print(title);
+    const char* weeks[] = {"日", "一", "二", "三", "四", "五", "六"};
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    for (int i = 0; i < 7; ++i) { u8f.setForegroundColor(i == 0 || i == 6 ? TFT_RED : TFT_LIGHTGREY); u8f.setCursor(18 + i * 44, 48); u8f.print(weeks[i]); }
+    struct tm first = {}; first.tm_year = year - 1900; first.tm_mon = month - 1; first.tm_mday = 1; mktime(&first);
+    int days = month == 2 ? (((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) ? 29 : 28) : ((month == 4 || month == 6 || month == 9 || month == 11) ? 30 : 31);
+    for (int day = 1; day <= days; ++day) {
+        int cell = first.tm_wday + day - 1, x = 12 + (cell % 7) * 44, y = 75 + (cell / 7) * 28;
+        String holiday = holidayName(month, day);
+        bool holidayBreak = year == 2026 && isHolidayBreak2026(month, day);
+        bool makeupWorkday = year == 2026 && isMakeupWorkday2026(month, day);
+        if (day == today) tft.fillRoundRect(x - 5, y - 16, 35, 22, 3, tft.color565(20, 85, 115));
+        u8f.setForegroundColor(makeupWorkday ? TFT_CYAN : (holidayBreak || holiday.length() ? TFT_YELLOW : ((cell % 7 == 0 || cell % 7 == 6) ? TFT_RED : TFT_WHITE)));
+        u8f.setCursor(x, y); u8f.print(day);
+        String marker = makeupWorkday ? "班" : (holiday.length() ? holiday : (holidayBreak ? "休" : ""));
+        if (marker.length()) { u8f.setCursor(x - 5, y + 13); u8f.print(marker); }
+    }
+}
+
+unsigned long currentTimerValue() {
+    unsigned long elapsed = timerElapsedMs + (timerRunning ? millis() - timerStartedAt : 0);
+    return timerCountdownMode ? (elapsed >= countdownDurationMs ? 0 : countdownDurationMs - elapsed) : elapsed;
+}
+
+void drawTimerValue() {
+    unsigned long value = currentTimerValue() / 1000;
+    char buf[16]; sprintf(buf, "%02lu:%02lu:%02lu", value / 3600, (value / 60) % 60, value % 60);
+    uint16_t background = timerAlarmActive && timerAlarmRed ? TFT_RED : TFT_BLACK;
+    tft.fillRect(20, 65, 280, 70, background);
+    tft.setTextDatum(MC_DATUM); tft.setTextSize(4); tft.setTextColor(TFT_WHITE, background);
+    tft.drawString(buf, 160, 100); tft.setTextSize(1);
+}
+
+void drawTimerPage() {
+    tft.fillScreen(TFT_BLACK); u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(15, 25);
+    u8f.print(timerCountdownMode ? "倒计时" : "秒表计时");
+    drawTimerValue(); u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    const char* labels[] = {timerRunning ? "暂停" : "开始", "复位", timerCountdownMode ? "秒表" : "倒计时"};
+    for (int i = 0; i < 3; ++i) { int x = 15 + i * 103; tft.drawRoundRect(x, 155, 85, 40, 4, TFT_CYAN); u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(x + 25, 181); u8f.print(labels[i]); }
+    if (timerCountdownMode) {
+        const char* adjust[] = {"-10", "-1", "+1", "+10"};
+        for (int i = 0; i < 4; ++i) {
+            int x = 5 + i * 79; tft.drawRoundRect(x, 205, 70, 30, 3, TFT_DARKGREY);
+            u8f.setCursor(x + 23, 226); u8f.print(adjust[i]);
+        }
+    }
+}
+
+void drawPcGraph(int x, int y, int width, int height, const float* values, uint16_t color) {
+    tft.drawRect(x, y, width, height, tft.color565(55, 65, 78));
+    for (int i = 1; i < 36; ++i) {
+        int x1 = x + 1 + (i - 1) * (width - 3) / 35;
+        int x2 = x + 1 + i * (width - 3) / 35;
+        int y1 = y + height - 2 - constrain(values[i - 1], 0.0f, 100.0f) * (height - 3) / 100.0f;
+        int y2 = y + height - 2 - constrain(values[i], 0.0f, 100.0f) * (height - 3) / 100.0f;
+        tft.drawLine(x1, y1, x2, y2, color);
+    }
+}
+
+void drawPcStatusPage() {
+    tft.fillScreen(TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    int o = pcScrollOffset;
+
+    tft.drawRoundRect(4, 5 + o, 312, 110, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, 24 + o); u8f.print("处理器");
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(70, 24 + o); u8f.print(pcCpuName.substring(0, 28));
+    u8f.setForegroundColor(TFT_GREEN); u8f.setCursor(14, 57 + o); u8f.print(String(pcCpuUsage, 1) + "%");
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 82 + o); u8f.print(String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程");
+    u8f.setCursor(14, 103 + o); u8f.print(String(pcCpuMaxMHz) + " MHz");
+    drawPcGraph(125, 42 + o, 178, 58, pcCpuHistory, TFT_GREEN);
+
+    tft.drawRoundRect(4, 122 + o, 312, 113, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 142 + o); u8f.print("显卡");
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(55, 142 + o); u8f.print(pcGpuName.substring(0, 31));
+    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 176 + o); u8f.print(String(pcGpuUsage, 1) + "%");
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 202 + o); u8f.print("显存 " + String(pcGpuMemoryMB / 1024.0f, 1) + " GB");
+    u8f.setCursor(14, 222 + o); u8f.print("驱动 " + pcGpuDriver);
+    drawPcGraph(125, 159 + o, 178, 60, pcGpuHistory, TFT_CYAN);
+
+    tft.drawRoundRect(4, 242 + o, 312, 105, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_MAGENTA); u8f.setCursor(12, 264 + o); u8f.print("内存与磁盘");
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(14, 292 + o); u8f.print("内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB");
+    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 316 + o); u8f.print("占用 " + String(pcMemoryUsage, 1) + "%");
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + o); u8f.print(pcDiskSummary);
+    pcStatusDirty = false;
+    lastPcStatusDraw = millis();
+}
+
 void drawDisplay() {
     if (currentPage == 0) {
         if (lyricActive && currentLyric.length() > 0) {
@@ -629,6 +885,14 @@ void drawDisplay() {
         drawTaskbar();
     } else if (currentPage == 2) {
         drawWeatherPage();
+    } else if (currentPage == 3) {
+        drawNewsPage();
+    } else if (currentPage == 4) {
+        drawCalendarPage();
+    } else if (currentPage == 5) {
+        drawTimerPage();
+    } else if (currentPage == 6) {
+        drawPcStatusPage();
     }
 }
 
@@ -649,6 +913,11 @@ void applyDesktopLyricPacket(const String& data) {
         else { currentLyric = fullText; currentTranslation = ""; }
         lyricActive = (currentLyric.length() > 0);
         lastLyricTime = millis();
+        lastInteractionMillis = millis();
+        if (lyricActive && screenHidden) {
+            screenHidden = false;
+            digitalWrite(TFT_BL, HIGH);
+        }
         if (currentPage == 0) drawDisplay();
     }
 }
@@ -714,6 +983,32 @@ void handleDesktopCommand(const String& line) {
         screenHidden = true;
         digitalWrite(TFT_BL, LOW);
         sendDesktopAck(cmd, "屏幕已关闭，点击屏幕唤醒");
+    } else if (strcmp(cmd, "pc_status") == 0) {
+        pcCpuName = doc["cpuName"].as<String>();
+        pcGpuName = doc["gpuName"].as<String>();
+        pcCpuUsage = doc["cpuUsage"] | 0.0f;
+        pcGpuUsage = doc["gpuUsage"] | 0.0f;
+        pcCpuCores = doc["cpuCores"] | 0;
+        pcCpuPhysicalCores = doc["cpuPhysicalCores"] | 0;
+        pcCpuMaxMHz = doc["cpuMaxMHz"] | 0;
+        pcMemoryUsedMB = doc["memoryUsedMB"] | 0;
+        pcMemoryTotalMB = doc["memoryTotalMB"] | 0;
+        pcMemoryUsage = doc["memoryUsage"] | 0.0f;
+        pcGpuMemoryMB = doc["gpuMemoryMB"] | 0;
+        pcGpuDriver = doc["gpuDriver"].as<String>();
+        JsonArray disks = doc["disks"].as<JsonArray>();
+        if (!disks.isNull() && disks.size() > 0) {
+            int freeMB = disks[0]["freeMB"] | 0;
+            int totalMB = disks[0]["totalMB"] | 0;
+            pcDiskSummary = disks[0]["name"].as<String>() + " " + String(freeMB / 1024.0f, 1) + "/" + String(totalMB / 1024.0f, 1) + " GB 可用";
+        }
+        for (int i = 0; i < 35; ++i) {
+            pcCpuHistory[i] = pcCpuHistory[i + 1];
+            pcGpuHistory[i] = pcGpuHistory[i + 1];
+        }
+        pcCpuHistory[35] = pcCpuUsage;
+        pcGpuHistory[35] = pcGpuUsage;
+        pcStatusDirty = true;
     } else if (strcmp(cmd, "reboot") == 0) {
         sendDesktopAck(cmd, "设备正在重启");
         delay(150);
@@ -815,20 +1110,63 @@ void loop() {
             fetchWeather();
             if (currentPage == 2) drawWeatherPage();
         }
+        if (millis() - lastNewsUpdate >= 900000UL || (!newsValid && lastNewsUpdate == 0)) {
+            fetchNews();
+            if (currentPage == 3) drawNewsPage();
+        }
     }
     if (millis() - lastTimeUpdate >= 1000) {
         if (!lyricActive) updateTimeFromSystemClock();
         if (currentPage == 0 && !lyricActive) {
             drawDisplay();
-        } else if (currentPage == 1) {
-            refreshInfoPage();
         }
         lastTimeUpdate = millis();
+    }
+
+    if (currentPage == 1 && millis() - lastInfoUpdate >= 1000) {
+        refreshInfoPage();
+        lastInfoUpdate = millis();
+    }
+
+    if (currentPage == 6 && pcStatusDirty && !screenHidden
+        && millis() - lastPcStatusDraw >= 1000) {
+        drawPcStatusPage();
+        pcStatusDirty = false;
+        lastPcStatusDraw = millis();
     }
 
     if (millis() - lastTelemetryUpdate >= 1000) {
         sendDesktopTelemetry();
         lastTelemetryUpdate = millis();
+    }
+
+    if (currentPage == 5 && timerRunning && millis() - lastTimerDraw >= 250) {
+        bool timerFinished = false;
+        if (timerCountdownMode && currentTimerValue() == 0) {
+            timerElapsedMs = countdownDurationMs;
+            timerRunning = false;
+            timerFinished = true;
+            timerAlarmActive = true;
+            timerAlarmRed = true;
+            lastTimerAlarmToggle = millis();
+        }
+        if (timerFinished) drawTimerPage(); else drawTimerValue();
+        lastTimerDraw = millis();
+    }
+
+    if (currentPage == 5 && timerAlarmActive && millis() - lastTimerAlarmToggle >= 500) {
+        timerAlarmRed = !timerAlarmRed;
+        lastTimerAlarmToggle = millis();
+        drawTimerValue();
+    }
+
+    if (currentPage == 2 && currentWeather.isValid && !weatherLoading) {
+        unsigned long animationInterval = static_cast<unsigned long>(constrain(260.0f - currentWeather.windSpeedKmh * 8.0f, 70.0f, 260.0f));
+        if (millis() - lastWindAnimation >= animationInterval) {
+            windAnimationPhase = (windAnimationPhase + 3) % 27;
+            lastWindAnimation = millis();
+            drawWindAnimation();
+        }
     }
 
     if (!screenHidden && millis() - lastInteractionMillis >= SCREEN_IDLE_TIMEOUT) {
@@ -873,6 +1211,24 @@ void loop() {
                     drawDisplay();
                     startY = p.y;
                     isSwiping = true;
+                } else if (currentPage == 3 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                    if (newsDetail) {
+                        newsDetailScrollOffset += dy / 20;
+                        newsDetailScrollOffset = constrain(newsDetailScrollOffset, -100, 0);
+                    } else {
+                    newsScrollOffset += dy / 20;
+                    int maxScroll = max(0, newsCount * 30 - 180);
+                    newsScrollOffset = constrain(newsScrollOffset, -maxScroll, 0);
+                    }
+                    drawDisplay();
+                    startY = p.y;
+                    isSwiping = true;
+                } else if (currentPage == 6 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                    pcScrollOffset += dy / 20;
+                    pcScrollOffset = constrain(pcScrollOffset, -115, 0);
+                    drawDisplay();
+                    startY = p.y;
+                    isSwiping = true;
                 }
             }
         }
@@ -886,18 +1242,54 @@ void loop() {
 
             // 只有当不是滑动操作时才处理点击
             if (!isSwiping) {
-                if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
+                if (currentPage == 5 && abs(finalDx) < 200 && abs(finalDy) < 200) {
+                    int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
+                    int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                    if (screenY >= 145 && screenY <= 205) {
+                        if (screenX < 105) {
+                            if (timerRunning) timerElapsedMs += millis() - timerStartedAt;
+                            else timerStartedAt = millis();
+                            timerRunning = !timerRunning;
+                        } else if (screenX < 210) {
+                            timerRunning = false; timerElapsedMs = 0;
+                            if (timerCountdownMode) countdownDurationMs = 0;
+                            timerAlarmActive = false; timerAlarmRed = false;
+                        } else {
+                            timerCountdownMode = !timerCountdownMode; timerRunning = false; timerElapsedMs = 0;
+                        }
+                    } else if (timerCountdownMode && screenY > 205) {
+                        long changeMinutes = screenX < 80 ? -10 : (screenX < 160 ? -1 : (screenX < 240 ? 1 : 10));
+                        long currentMinutes = countdownDurationMs / 60000UL;
+                        currentMinutes = constrain(currentMinutes + changeMinutes, 1L, 5999L);
+                        countdownDurationMs = static_cast<unsigned long>(currentMinutes) * 60000UL;
+                        timerElapsedMs = 0;
+                    }
+                    drawDisplay();
+                } else if (currentPage == 3 && abs(finalDx) < 200 && abs(finalDy) < 200) {
+                    int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
+                    int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                    if (newsDetail && screenX < 90 && screenY < 45) {
+                        newsDetail = false; newsDetailIndex = -1; newsDetailScrollOffset = 0; drawDisplay();
+                    } else if (!newsDetail && screenY >= 30) {
+                        int index = (screenY - 52 - newsScrollOffset) / 30;
+                        if (index >= 0 && index < newsCount) { newsDetail = true; newsDetailIndex = index; newsDetailScrollOffset = 0; drawDisplay(); }
+                    }
+                } else if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
                     // 音乐控制点击已处理
                 } else if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
                     currentPage = (currentPage - 1 + MAX_PAGES) % MAX_PAGES;
                     scrollOffset = 0;
                     weatherScrollOffset = 0;
+                    newsScrollOffset = 0;
+                    pcScrollOffset = 0;
                     lastTimeStr = ""; // 重置时间显示状态
                     drawDisplay();
                 } else if (finalDx < -SWIPE_MIN_X) { // 向左划：下一页
                     currentPage = (currentPage + 1) % MAX_PAGES;
                     scrollOffset = 0;
                     weatherScrollOffset = 0;
+                    newsScrollOffset = 0;
+                    pcScrollOffset = 0;
                     lastTimeStr = ""; // 重置时间显示状态
                     drawDisplay();
                 }
