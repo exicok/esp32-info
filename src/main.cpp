@@ -9,6 +9,7 @@
 #include <U8g2_for_TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 // ============ 用户配置区（可自定义修改） ============
 
@@ -90,8 +91,20 @@ int pcMemoryTotalMB = 0;
 int pcGpuMemoryMB = 0;
 int pcCpuPhysicalCores = 0;
 int pcCpuMaxMHz = 0;
+int pcCpuCurrentMHz = 0;
+float pcCpuPowerWatts = -1;
 float pcMemoryUsage = 0;
 String pcGpuDriver = "";
+String pcGpuNames[4];
+String pcGpuVendors[4];
+String pcGpuDriverVersions[4];
+String pcGpuDriverDates[4];
+int pcGpuMemoryMBs[4] = {0};
+int pcGpuDedicatedUsedMBs[4] = {0};
+int pcGpuSharedUsedMBs[4] = {0};
+float pcGpuUsages[4] = {0};
+int pcGpuFanPercents[4] = {-1, -1, -1, -1};
+int pcGpuCount = 0;
 String pcDiskSummary = "等待磁盘数据";
 int pcScrollOffset = 0;
 bool pcStatusDirty = false;
@@ -99,9 +112,27 @@ unsigned long lastPcStatusDraw = 0;
 float pcCpuHistory[36] = {0};
 float pcGpuHistory[36] = {0};
 float pcGpuUsage = 0;
+unsigned long pcSyncLatencyMs = 0;
+String pcRenderedValues[10];
 
 int currentPage = 0;
-#define MAX_PAGES 7
+#define MAX_PAGES 8
+
+struct WorldClockRow {
+    const char* name;
+    int utcOffsetHours;
+    uint16_t color;
+};
+const WorldClockRow WORLD_CLOCK_ROWS[] = {
+    {"中国北京 UTC+8", 8, TFT_YELLOW},
+    {"世界标准 UTC+0", 0, TFT_WHITE},
+    {"英国伦敦 UTC+0", 0, TFT_GREEN},
+    {"美国纽约 UTC-5", -5, TFT_CYAN},
+    {"日本东京 UTC+9", 9, TFT_MAGENTA},
+    {"澳洲悉尼 UTC+10", 10, TFT_ORANGE}
+};
+String worldClockRenderedValues[6];
+bool worldClockLayoutReady = false;
 
 // 天气数据结构
 struct WeatherData {
@@ -152,6 +183,10 @@ unsigned long lastTimerDraw = 0;
 bool timerAlarmActive = false;
 bool timerAlarmRed = false;
 unsigned long lastTimerAlarmToggle = 0;
+unsigned long lastTimerMemorySave = 0;
+String lastTimerValueStr = "";
+uint16_t lastTimerBackground = 0xFFFF;
+Preferences timerPreferences;
 unsigned long lastNewsUpdate = 0;
 
 int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int lineHeight);
@@ -399,13 +434,14 @@ void drawInfoContent(bool forceRefresh) {
 
     curY += 10;
     // 系统状态
-    drawCard(curY - 18, 101);
+    drawCard(curY - 18, 126);
     u8f.setForegroundColor(TFT_YELLOW);
     u8f.setCursor(10, curY); u8f.print("--- 系统状态 ---"); curY += lineHeight;
     char cpuBuf[16];
     sprintf(cpuBuf, "%.1f%%", cpuUsagePercent);
     drawRow("CPU占有率:", cpuBuf, TFT_CYAN);
     drawRow("开机时间:", formatUptime(millis()), TFT_WHITE);
+    drawRow("同步延迟:", String(pcSyncLatencyMs) + " ms", pcSyncLatencyMs < 100 ? TFT_GREEN : TFT_YELLOW);
 }
 
 void drawWeatherPage();
@@ -754,32 +790,128 @@ void drawCalendarPage() {
     }
 }
 
+String formatWorldTime(time_t utcNow, int utcOffsetHours) {
+    time_t localTime = utcNow + static_cast<time_t>(utcOffsetHours) * 3600;
+    struct tm value;
+    gmtime_r(&localTime, &value);
+    char buffer[24];
+    strftime(buffer, sizeof(buffer), "%m-%d %H:%M:%S", &value);
+    return String(buffer);
+}
+
+void drawWorldTimePage();
+
+void refreshWorldTimePage() {
+    if (!desktopTimeSynced && !wifiTimeSynced) return;
+    if (!worldClockLayoutReady) {
+        drawWorldTimePage();
+        return;
+    }
+
+    time_t utcNow = time(nullptr);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_WHITE);
+    for (int i = 0; i < 6; ++i) {
+        String value = formatWorldTime(utcNow, WORLD_CLOCK_ROWS[i].utcOffsetHours);
+        if (value == worldClockRenderedValues[i]) continue;
+        int y = 52 + i * 30;
+        tft.fillRect(186, y - 16, 132, 20, TFT_BLACK);
+        u8f.setCursor(188, y); u8f.print(value);
+        worldClockRenderedValues[i] = value;
+    }
+}
+
+void drawWorldTimePage() {
+    tft.fillScreen(TFT_BLACK);
+    worldClockLayoutReady = false;
+    for (int i = 0; i < 6; ++i) worldClockRenderedValues[i] = "";
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
+    u8f.setCursor(12, 22); u8f.print("世界时间（北京时间换算）");
+
+    if (!desktopTimeSynced && !wifiTimeSynced) {
+        u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_YELLOW);
+        u8f.setCursor(68, 125); u8f.print("等待北京时间同步...");
+        return;
+    }
+
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    for (int i = 0; i < 6; ++i) {
+        int y = 52 + i * 30;
+        u8f.setForegroundColor(WORLD_CLOCK_ROWS[i].color);
+        u8f.setCursor(10, y); u8f.print(WORLD_CLOCK_ROWS[i].name);
+    }
+    worldClockLayoutReady = true;
+    refreshWorldTimePage();
+}
+
 unsigned long currentTimerValue() {
     unsigned long elapsed = timerElapsedMs + (timerRunning ? millis() - timerStartedAt : 0);
     return timerCountdownMode ? (elapsed >= countdownDurationMs ? 0 : countdownDurationMs - elapsed) : elapsed;
 }
 
+void saveTimerMemory() {
+    unsigned long savedElapsed = timerElapsedMs + (timerRunning ? millis() - timerStartedAt : 0);
+    if (timerCountdownMode && savedElapsed > countdownDurationMs) savedElapsed = countdownDurationMs;
+    timerPreferences.putBool("countdown", timerCountdownMode);
+    timerPreferences.putULong("duration", countdownDurationMs);
+    timerPreferences.putULong("elapsed", savedElapsed);
+    lastTimerMemorySave = millis();
+}
+
+void loadTimerMemory() {
+    timerCountdownMode = timerPreferences.getBool("countdown", false);
+    countdownDurationMs = timerPreferences.getULong("duration", 300000UL);
+    timerElapsedMs = timerPreferences.getULong("elapsed", 0);
+    if (countdownDurationMs == 0) countdownDurationMs = 300000UL;
+    if (timerCountdownMode && timerElapsedMs > countdownDurationMs)
+        timerElapsedMs = countdownDurationMs;
+    timerRunning = false;
+    timerAlarmActive = false;
+}
+
 void drawTimerValue() {
     unsigned long value = currentTimerValue() / 1000;
     char buf[16]; sprintf(buf, "%02lu:%02lu:%02lu", value / 3600, (value / 60) % 60, value % 60);
+    String currentValue = String(buf);
     uint16_t background = timerAlarmActive && timerAlarmRed ? TFT_RED : TFT_BLACK;
-    tft.fillRect(20, 65, 280, 70, background);
     tft.setTextDatum(MC_DATUM); tft.setTextSize(4); tft.setTextColor(TFT_WHITE, background);
-    tft.drawString(buf, 160, 100); tft.setTextSize(1);
+    int charWidth = tft.textWidth("0");
+    int startX = 160 - charWidth * 4;
+
+    if (lastTimerValueStr.length() != currentValue.length() || lastTimerBackground != background) {
+        tft.fillRect(20, 65, 280, 70, background);
+        for (int i = 0; i < currentValue.length(); ++i) {
+            int charX = startX + i * charWidth + charWidth / 2;
+            tft.drawString(String(currentValue[i]), charX, 100);
+        }
+    } else {
+        for (int i = 0; i < currentValue.length(); ++i) {
+            if (currentValue[i] == lastTimerValueStr[i]) continue;
+            int charX = startX + i * charWidth + charWidth / 2;
+            tft.fillRect(charX - charWidth / 2, 70, charWidth, 60, background);
+            tft.drawString(String(currentValue[i]), charX, 100);
+        }
+    }
+    lastTimerValueStr = currentValue;
+    lastTimerBackground = background;
+    tft.setTextSize(1);
 }
 
 void drawTimerPage() {
     tft.fillScreen(TFT_BLACK); u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    lastTimerValueStr = "";
+    lastTimerBackground = 0xFFFF;
     u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(15, 25);
     u8f.print(timerCountdownMode ? "倒计时" : "秒表计时");
     drawTimerValue(); u8f.setFont(u8g2_font_wqy12_t_gb2312);
     const char* labels[] = {timerRunning ? "暂停" : "开始", "复位", timerCountdownMode ? "秒表" : "倒计时"};
     for (int i = 0; i < 3; ++i) { int x = 15 + i * 103; tft.drawRoundRect(x, 155, 85, 40, 4, TFT_CYAN); u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(x + 25, 181); u8f.print(labels[i]); }
     if (timerCountdownMode) {
-        const char* adjust[] = {"-10", "-1", "+1", "+10"};
+        const char* presets[] = {"5分", "15分", "30分", "60分"};
         for (int i = 0; i < 4; ++i) {
             int x = 5 + i * 79; tft.drawRoundRect(x, 205, 70, 30, 3, TFT_DARKGREY);
-            u8f.setCursor(x + 23, 226); u8f.print(adjust[i]);
+            u8f.setCursor(x + 20, 226); u8f.print(presets[i]);
         }
     }
 }
@@ -795,6 +927,84 @@ void drawPcGraph(int x, int y, int width, int height, const float* values, uint1
     }
 }
 
+void cachePcRenderedValues() {
+    pcRenderedValues[0] = pcCpuName.substring(0, 28);
+    pcRenderedValues[1] = String(pcCpuUsage, 1) + "%";
+    pcRenderedValues[2] = String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程";
+    pcRenderedValues[3] = String(pcCpuCurrentMHz) + " MHz  "
+        + (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 1) + " W" : "-- W");
+    pcRenderedValues[4] = pcGpuName.substring(0, 31);
+    pcRenderedValues[5] = String(pcGpuUsage, 1) + "%";
+    pcRenderedValues[6] = "显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB";
+    pcRenderedValues[7] = pcGpuFanPercents[0] >= 0
+        ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用";
+    pcRenderedValues[8] = "内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB";
+    pcRenderedValues[9] = "占用 " + String(pcMemoryUsage, 1) + "%";
+}
+
+void refreshPcStatusPage() {
+    int o = pcScrollOffset;
+    String values[10] = {
+        pcCpuName.substring(0, 28), String(pcCpuUsage, 1) + "%",
+        String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程",
+        String(pcCpuCurrentMHz) + " MHz  "
+            + (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 1) + " W" : "-- W"), pcGpuName.substring(0, 31),
+        String(pcGpuUsage, 1) + "%", "显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB",
+        pcGpuFanPercents[0] >= 0 ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用",
+        "内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB",
+        "占用 " + String(pcMemoryUsage, 1) + "%"
+    };
+    const int x[10] = {70, 14, 14, 14, 55, 14, 14, 14, 14, 14};
+    const int y[10] = {24, 57, 82, 103, 142, 176, 202, 222, 292, 316};
+    const int width[10] = {238, 105, 105, 105, 253, 105, 105, 105, 292, 292};
+    const uint16_t color[10] = {TFT_WHITE, TFT_GREEN, TFT_LIGHTGREY, TFT_LIGHTGREY,
+        TFT_WHITE, TFT_CYAN, TFT_LIGHTGREY, TFT_LIGHTGREY, TFT_WHITE, TFT_CYAN};
+
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    for (int i = 0; i < 10; ++i) {
+        if (values[i] == pcRenderedValues[i]) continue;
+        tft.fillRect(x[i] - 2, y[i] - 16 + o, width[i], 19, TFT_BLACK);
+        u8f.setForegroundColor(color[i]);
+        u8f.setCursor(x[i], y[i] + o); u8f.print(values[i]);
+        pcRenderedValues[i] = values[i];
+    }
+    tft.fillRect(124, 41 + o, 180, 62, TFT_BLACK);
+    drawPcGraph(125, 42 + o, 178, 58, pcCpuHistory, TFT_GREEN);
+    tft.fillRect(124, 158 + o, 180, 63, TFT_BLACK);
+    drawPcGraph(125, 159 + o, 178, 60, pcGpuHistory, TFT_CYAN);
+
+    static String renderedDisk;
+    if (renderedDisk != pcDiskSummary) {
+        tft.fillRect(12, 322 + o, 296, 19, TFT_BLACK);
+        u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + o); u8f.print(pcDiskSummary);
+        renderedDisk = pcDiskSummary;
+    }
+    static String renderedGpuRows[4];
+    if (pcGpuCount > 0) {
+        for (int i = 0; i < pcGpuCount; ++i) {
+            String signature = pcGpuNames[i] + pcGpuVendors[i] + String(pcGpuUsages[i], 1)
+                + String(pcGpuDedicatedUsedMBs[i]) + String(pcGpuSharedUsedMBs[i])
+                + String(pcGpuFanPercents[i])
+                + pcGpuDriverVersions[i] + pcGpuDriverDates[i];
+            if (signature == renderedGpuRows[i]) continue;
+            int top = 382 + i * 118 + o;
+            tft.fillRect(9, top + 1, 302, 109, TFT_BLACK);
+            u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20);
+            u8f.print(String(i + 1) + ". " + pcGpuNames[i].substring(0, 28));
+            u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(12, top + 42);
+            u8f.print(pcGpuVendors[i].substring(0, 15) + " 占用 " + String(pcGpuUsages[i], 1) + "% "
+                + (pcGpuFanPercents[i] >= 0 ? "风扇 " + String(pcGpuFanPercents[i]) + "%" : "风扇不可用"));
+            u8f.setCursor(12, top + 64); u8f.print("独显已用 " + String(pcGpuDedicatedUsedMBs[i]) + " MB");
+            u8f.setCursor(12, top + 86); u8f.print("共享 " + String(pcGpuSharedUsedMBs[i]) + " MB");
+            u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(12, top + 107);
+            u8f.print("驱动 " + pcGpuDriverVersions[i].substring(0, 18) + " " + pcGpuDriverDates[i]);
+            renderedGpuRows[i] = signature;
+        }
+    }
+    pcStatusDirty = false;
+    lastPcStatusDraw = millis();
+}
+
 void drawPcStatusPage() {
     tft.fillScreen(TFT_BLACK);
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
@@ -804,16 +1014,20 @@ void drawPcStatusPage() {
     u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, 24 + o); u8f.print("处理器");
     u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(70, 24 + o); u8f.print(pcCpuName.substring(0, 28));
     u8f.setForegroundColor(TFT_GREEN); u8f.setCursor(14, 57 + o); u8f.print(String(pcCpuUsage, 1) + "%");
-    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 82 + o); u8f.print(String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程");
-    u8f.setCursor(14, 103 + o); u8f.print(String(pcCpuMaxMHz) + " MHz");
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 82 + o);
+    u8f.print(String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程");
+    u8f.setCursor(14, 103 + o); u8f.print(String(pcCpuCurrentMHz) + " MHz  "
+        + (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 1) + " W" : "-- W"));
     drawPcGraph(125, 42 + o, 178, 58, pcCpuHistory, TFT_GREEN);
 
     tft.drawRoundRect(4, 122 + o, 312, 113, 6, tft.color565(55, 65, 78));
     u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 142 + o); u8f.print("显卡");
     u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(55, 142 + o); u8f.print(pcGpuName.substring(0, 31));
     u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 176 + o); u8f.print(String(pcGpuUsage, 1) + "%");
-    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 202 + o); u8f.print("显存 " + String(pcGpuMemoryMB / 1024.0f, 1) + " GB");
-    u8f.setCursor(14, 222 + o); u8f.print("驱动 " + pcGpuDriver);
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 202 + o);
+    u8f.print("显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB");
+    u8f.setCursor(14, 222 + o); u8f.print(pcGpuFanPercents[0] >= 0
+        ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用");
     drawPcGraph(125, 159 + o, 178, 60, pcGpuHistory, TFT_CYAN);
 
     tft.drawRoundRect(4, 242 + o, 312, 105, 6, tft.color565(55, 65, 78));
@@ -821,6 +1035,24 @@ void drawPcStatusPage() {
     u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(14, 292 + o); u8f.print("内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB");
     u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 316 + o); u8f.print("占用 " + String(pcMemoryUsage, 1) + "%");
     u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + o); u8f.print(pcDiskSummary);
+    if (pcGpuCount > 0) {
+        int cardHeight = 35 + pcGpuCount * 118;
+        tft.drawRoundRect(4, 354 + o, 312, cardHeight, 6, tft.color565(55, 65, 78));
+        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 375 + o); u8f.print("显卡详细状态");
+        for (int i = 0; i < pcGpuCount; ++i) {
+            int top = 382 + i * 118 + o;
+            u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20);
+            u8f.print(String(i + 1) + ". " + pcGpuNames[i].substring(0, 28));
+            u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(12, top + 42);
+            u8f.print(pcGpuVendors[i].substring(0, 15) + " 占用 " + String(pcGpuUsages[i], 1) + "% "
+                + (pcGpuFanPercents[i] >= 0 ? "风扇 " + String(pcGpuFanPercents[i]) + "%" : "风扇不可用"));
+            u8f.setCursor(12, top + 64); u8f.print("独显已用 " + String(pcGpuDedicatedUsedMBs[i]) + " MB");
+            u8f.setCursor(12, top + 86); u8f.print("共享 " + String(pcGpuSharedUsedMBs[i]) + " MB");
+            u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(12, top + 107);
+            u8f.print("驱动 " + pcGpuDriverVersions[i].substring(0, 18) + " " + pcGpuDriverDates[i]);
+        }
+    }
+    cachePcRenderedValues();
     pcStatusDirty = false;
     lastPcStatusDraw = millis();
 }
@@ -893,6 +1125,8 @@ void drawDisplay() {
         drawTimerPage();
     } else if (currentPage == 6) {
         drawPcStatusPage();
+    } else if (currentPage == 7) {
+        drawWorldTimePage();
     }
 }
 
@@ -961,7 +1195,7 @@ void sendDesktopTelemetry() {
 }
 
 void handleDesktopCommand(const String& line) {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(6144);
     DeserializationError error = deserializeJson(doc, line);
     if (error) return;
 
@@ -991,11 +1225,39 @@ void handleDesktopCommand(const String& line) {
         pcCpuCores = doc["cpuCores"] | 0;
         pcCpuPhysicalCores = doc["cpuPhysicalCores"] | 0;
         pcCpuMaxMHz = doc["cpuMaxMHz"] | 0;
+        pcCpuCurrentMHz = doc["cpuCurrentMHz"] | pcCpuMaxMHz;
+        pcCpuPowerWatts = doc["cpuPowerWatts"] | -1.0f;
         pcMemoryUsedMB = doc["memoryUsedMB"] | 0;
         pcMemoryTotalMB = doc["memoryTotalMB"] | 0;
         pcMemoryUsage = doc["memoryUsage"] | 0.0f;
         pcGpuMemoryMB = doc["gpuMemoryMB"] | 0;
+        pcGpuFanPercents[0] = doc["gpuFanPercent"] | -1;
         pcGpuDriver = doc["gpuDriver"].as<String>();
+        JsonArray gpuArray = doc["gpus"].as<JsonArray>();
+        pcGpuCount = 0;
+        if (!gpuArray.isNull()) {
+            for (JsonObject gpu : gpuArray) {
+                if (pcGpuCount >= 4) break;
+                pcGpuNames[pcGpuCount] = gpu["name"].as<String>();
+                pcGpuVendors[pcGpuCount] = gpu["vendor"].as<String>();
+                pcGpuDriverVersions[pcGpuCount] = gpu["driverVersion"].as<String>();
+                pcGpuDriverDates[pcGpuCount] = gpu["driverDate"].as<String>();
+                pcGpuMemoryMBs[pcGpuCount] = gpu["memoryMB"] | 0;
+                pcGpuDedicatedUsedMBs[pcGpuCount] = gpu["dedicatedUsedMB"] | 0;
+                pcGpuSharedUsedMBs[pcGpuCount] = gpu["sharedUsedMB"] | 0;
+                pcGpuUsages[pcGpuCount] = gpu["usage"] | 0.0f;
+                pcGpuFanPercents[pcGpuCount] = gpu["fanPercent"] | -1;
+                ++pcGpuCount;
+            }
+        }
+        uint64_t sentEpochMs = doc["sentEpochMs"] | 0ULL;
+        if (sentEpochMs > 0) {
+            struct timeval now;
+            gettimeofday(&now, nullptr);
+            uint64_t nowEpochMs = static_cast<uint64_t>(now.tv_sec) * 1000ULL + now.tv_usec / 1000ULL;
+            uint64_t latencyMs = nowEpochMs >= sentEpochMs ? nowEpochMs - sentEpochMs : 0;
+            pcSyncLatencyMs = static_cast<unsigned long>(latencyMs > 9999ULL ? 9999ULL : latencyMs);
+        }
         JsonArray disks = doc["disks"].as<JsonArray>();
         if (!disks.isNull() && disks.size() > 0) {
             int freeMB = disks[0]["freeMB"] | 0;
@@ -1023,7 +1285,7 @@ void readDesktopCommands() {
             desktopCommandBuffer.trim();
             if (desktopCommandBuffer.length() > 0) handleDesktopCommand(desktopCommandBuffer);
             desktopCommandBuffer = "";
-        } else if (c != '\r' && desktopCommandBuffer.length() < 2048) {
+        } else if (c != '\r' && desktopCommandBuffer.length() < 4096) {
             desktopCommandBuffer += c;
         }
     }
@@ -1086,7 +1348,9 @@ void updateTimeFromSystemClock() {
 
 void setup() {
     Serial.begin(115200);
-    desktopCommandBuffer.reserve(2048);
+    timerPreferences.begin("timer", false);
+    loadTimerMemory();
+    desktopCommandBuffer.reserve(4096);
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
     SPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI);
     touchscreen.begin(); touchscreen.setRotation(1);
@@ -1119,6 +1383,8 @@ void loop() {
         if (!lyricActive) updateTimeFromSystemClock();
         if (currentPage == 0 && !lyricActive) {
             drawDisplay();
+        } else if (currentPage == 7 && !screenHidden) {
+            refreshWorldTimePage();
         }
         lastTimeUpdate = millis();
     }
@@ -1129,8 +1395,8 @@ void loop() {
     }
 
     if (currentPage == 6 && pcStatusDirty && !screenHidden
-        && millis() - lastPcStatusDraw >= 1000) {
-        drawPcStatusPage();
+        && millis() - lastPcStatusDraw >= 300) {
+        refreshPcStatusPage();
         pcStatusDirty = false;
         lastPcStatusDraw = millis();
     }
@@ -1149,6 +1415,7 @@ void loop() {
             timerAlarmActive = true;
             timerAlarmRed = true;
             lastTimerAlarmToggle = millis();
+            saveTimerMemory();
         }
         if (timerFinished) drawTimerPage(); else drawTimerValue();
         lastTimerDraw = millis();
@@ -1160,6 +1427,10 @@ void loop() {
         drawTimerValue();
     }
 
+    if (timerRunning && millis() - lastTimerMemorySave >= 30000UL) {
+        saveTimerMemory();
+    }
+
     if (currentPage == 2 && currentWeather.isValid && !weatherLoading) {
         unsigned long animationInterval = static_cast<unsigned long>(constrain(260.0f - currentWeather.windSpeedKmh * 8.0f, 70.0f, 260.0f));
         if (millis() - lastWindAnimation >= animationInterval) {
@@ -1169,7 +1440,8 @@ void loop() {
         }
     }
 
-    if (!screenHidden && millis() - lastInteractionMillis >= SCREEN_IDLE_TIMEOUT) {
+    if (currentPage != 5 && currentPage != 6 && !screenHidden
+        && millis() - lastInteractionMillis >= SCREEN_IDLE_TIMEOUT) {
         screenHidden = true;
         digitalWrite(TFT_BL, LOW);
     }
@@ -1225,7 +1497,8 @@ void loop() {
                     isSwiping = true;
                 } else if (currentPage == 6 && abs(dy) > abs(dx) && abs(dy) > 200) {
                     pcScrollOffset += dy / 20;
-                    pcScrollOffset = constrain(pcScrollOffset, -115, 0);
+                    pcScrollOffset = constrain(pcScrollOffset,
+                        pcGpuCount > 0 ? -(pcGpuCount * 118 + 160) : -115, 0);
                     drawDisplay();
                     startY = p.y;
                     isSwiping = true;
@@ -1250,19 +1523,24 @@ void loop() {
                             if (timerRunning) timerElapsedMs += millis() - timerStartedAt;
                             else timerStartedAt = millis();
                             timerRunning = !timerRunning;
+                            timerAlarmActive = false; timerAlarmRed = false;
                         } else if (screenX < 210) {
                             timerRunning = false; timerElapsedMs = 0;
-                            if (timerCountdownMode) countdownDurationMs = 0;
                             timerAlarmActive = false; timerAlarmRed = false;
                         } else {
                             timerCountdownMode = !timerCountdownMode; timerRunning = false; timerElapsedMs = 0;
+                            if (timerCountdownMode && countdownDurationMs == 0) countdownDurationMs = 300000UL;
                         }
+                        saveTimerMemory();
                     } else if (timerCountdownMode && screenY > 205) {
-                        long changeMinutes = screenX < 80 ? -10 : (screenX < 160 ? -1 : (screenX < 240 ? 1 : 10));
-                        long currentMinutes = countdownDurationMs / 60000UL;
-                        currentMinutes = constrain(currentMinutes + changeMinutes, 1L, 5999L);
-                        countdownDurationMs = static_cast<unsigned long>(currentMinutes) * 60000UL;
+                        const unsigned long presetMinutes[] = {5, 15, 30, 60};
+                        int presetIndex = constrain(screenX / 80, 0, 3);
+                        countdownDurationMs = presetMinutes[presetIndex] * 60000UL;
                         timerElapsedMs = 0;
+                        timerStartedAt = millis();
+                        timerRunning = true;
+                        timerAlarmActive = false; timerAlarmRed = false;
+                        saveTimerMemory();
                     }
                     drawDisplay();
                 } else if (currentPage == 3 && abs(finalDx) < 200 && abs(finalDy) < 200) {
