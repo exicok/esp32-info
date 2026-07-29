@@ -1,10 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <time.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <esp_sntp.h>
 #include <TFT_eSPI.h>
 #include <U8g2_for_TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
@@ -15,19 +11,14 @@
 
 // 天气配置
 const char* WEATHER_CITY = "云南大理祥云";  // 显示名称
-const float WEATHER_LAT = 25.48;            // 祥云县纬度
-const float WEATHER_LON = 100.56;           // 祥云县经度
 
-// WiFi 与网络校时配置。SSID 留空时禁用 WiFi 校时。
-const char* WIFI_SSID = "ChinaNet-GWpJ";
-const char* WIFI_PASSWORD = "12345678";
-const char* NTP_SERVER_1 = "ntp.aliyun.com";
-const char* NTP_SERVER_2 = "pool.ntp.org";
 const long LOCAL_UTC_OFFSET_SECONDS = 8 * 3600;
 
 // ============ 配置区结束 ============
 
 TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite pcGraphSprite = TFT_eSprite(&tft);
+bool pcGraphSpriteReady = false;
 U8g2_for_TFT_eSPI u8f;
 
 // 触摸屏引脚
@@ -65,16 +56,11 @@ unsigned long lastInfoUpdate = 0;
 unsigned long lastTelemetryUpdate = 0;
 long desktopUtcOffsetSeconds = LOCAL_UTC_OFFSET_SECONDS;
 bool desktopTimeSynced = false;
-bool wifiTimeSynced = false;
-bool wifiNtpStarted = false;
-volatile bool wifiNtpSyncPending = false;
-unsigned long lastWifiConnectAttempt = 0;
 String desktopCommandBuffer = "";
 
-enum class TimeSource { NONE, DESKTOP, WIFI_NTP };
+enum class TimeSource { NONE, DESKTOP };
 TimeSource activeTimeSource = TimeSource::NONE;
 
-const unsigned long WIFI_RECONNECT_INTERVAL = 30000;
 
 // CPU使用率计算
 unsigned long lastCpuUpdate = 0;
@@ -104,16 +90,32 @@ int pcGpuDedicatedUsedMBs[4] = {0};
 int pcGpuSharedUsedMBs[4] = {0};
 float pcGpuUsages[4] = {0};
 int pcGpuFanPercents[4] = {-1, -1, -1, -1};
+int pcGpuFanRpms[4] = {-1, -1, -1, -1};
+float pcGpuPowerWattValues[4] = {-1, -1, -1, -1};
 int pcGpuCount = 0;
 String pcDiskSummary = "等待磁盘数据";
 int pcScrollOffset = 0;
 bool pcStatusDirty = false;
 unsigned long lastPcStatusDraw = 0;
+unsigned long lastPcScrollDraw = 0;
 float pcCpuHistory[36] = {0};
 float pcGpuHistory[36] = {0};
+float pcFpsHistory[36] = {0};
+float pcGpuHistories[4][36] = {{0}};
+float pcCpuCoreUsages[32] = {0};
+int pcCpuCoreCount = 0;
+int pcCpuCoreRendered[32] = {-1};
+bool pcFpsFullscreen = false;
 float pcGpuUsage = 0;
+float pcGpuPowerWatts = -1;
+float pcFps = -1;
+float pcFrameTimeMs = -1;
+String pcGraphicsApi = "--";
 unsigned long pcSyncLatencyMs = 0;
 String pcRenderedValues[10];
+String pcSummaryRenderedValues[8];
+String pcGraphicsRenderedValues[2];
+const int PC_DETAIL_OFFSET = 416;
 
 int currentPage = 0;
 #define MAX_PAGES 8
@@ -156,24 +158,10 @@ struct ForecastData {
 
 WeatherData currentWeather = {"", "", "", "", "", "", 0.0f, 0.0f, false};
 ForecastData forecast[7];
-unsigned long lastWeatherUpdate = 0;
-unsigned long lastWeatherAttempt = 0;
 unsigned long lastWindAnimation = 0;
 uint8_t windAnimationPhase = 0;
-const unsigned long WEATHER_UPDATE_INTERVAL = 1800000; // 30分钟更新一次
-const unsigned long WEATHER_RETRY_INTERVAL = 60000;     // 失败后1分钟重试
-bool weatherLoading = false;
-String weatherError = "";
 String weatherCity = WEATHER_CITY; // 使用配置区的城市名称
 
-struct NewsItem { String title; String body; String source; };
-NewsItem newsItems[30];
-int newsCount = 0;
-bool newsValid = false;
-bool newsDetail = false;
-int newsDetailIndex = -1;
-int newsScrollOffset = 0;
-int newsDetailScrollOffset = 0;
 bool timerCountdownMode = false;
 bool timerRunning = false;
 unsigned long timerStartedAt = 0;
@@ -187,83 +175,10 @@ unsigned long lastTimerMemorySave = 0;
 String lastTimerValueStr = "";
 uint16_t lastTimerBackground = 0xFFFF;
 Preferences timerPreferences;
-unsigned long lastNewsUpdate = 0;
+String pendingPcControlAction = "";
+unsigned long pendingPcControlUntil = 0;
 
 int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int lineHeight);
-
-String xmlValue(const String& xml, const char* tag, int from) {
-    String open = String("<") + tag + ">", close = String("</") + tag + ">";
-    int a = xml.indexOf(open, from), b;
-    if (a < 0) return "";
-    a += open.length(); b = xml.indexOf(close, a);
-    if (b < 0) return "";
-    String value = xml.substring(a, b); value.replace("&amp;", "&"); value.replace("&quot;", "\"");
-    return value;
-}
-
-bool fetchNews() {
-    if (WiFi.status() != WL_CONNECTED) return false;
-    WiFiClientSecure client; client.setInsecure(); HTTPClient http;
-    const char* feeds[] = {
-        "https://www.chinanews.com.cn/rss/scroll-news.xml",
-        "https://www.chinanews.com.cn/rss/china.xml",
-        "https://www.chinanews.com.cn/rss/world.xml"
-    };
-    newsCount = 0;
-    for (const char* feed : feeds) {
-        if (newsCount >= 30 || !http.begin(client, feed)) continue;
-        http.setTimeout(10000);
-        if (http.GET() == HTTP_CODE_OK) {
-            String xml = http.getString(); int pos = 0;
-            while (newsCount < 30) {
-                int item = xml.indexOf("<item>", pos); if (item < 0) break;
-                String title = xmlValue(xml, "title", item);
-                if (title.length()) {
-                    String body = xmlValue(xml, "description", item);
-                    if (body.length() == 0) body = xmlValue(xml, "content:encoded", item);
-                    body.replace("<![CDATA[", ""); body.replace("]]>", "");
-                    newsItems[newsCount].title = title;
-                    newsItems[newsCount].body = body;
-                    newsItems[newsCount].source = feed;
-                    newsCount++;
-                }
-                pos = item + 6;
-            }
-        }
-        http.end();
-    }
-    newsValid = newsCount > 0; lastNewsUpdate = millis();
-    return newsValid;
-}
-
-void drawNewsPage() {
-    tft.fillScreen(TFT_BLACK); u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
-    if (newsDetail && newsDetailIndex >= 0 && newsDetailIndex < newsCount) {
-        u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(8, 22); u8f.print("< 返回");
-        u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_WHITE);
-        int titleLines = drawWrappedTextCentered(newsItems[newsDetailIndex].title, 160, 52, 300, 18);
-        u8f.setForegroundColor(TFT_LIGHTGREY);
-        String body = newsItems[newsDetailIndex].body;
-        if (body.length() == 0) body = "暂无正文摘要";
-        drawWrappedTextCentered(body, 160, 58 + titleLines * 18 + newsDetailScrollOffset, 300, 16);
-        u8f.setForegroundColor(TFT_DARKGREY); u8f.setCursor(10, 220); u8f.print("来源: " + newsItems[newsDetailIndex].source);
-        return;
-    }
-    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
-    u8f.setCursor(12, 24); u8f.print("新闻");
-    u8f.setFont(u8g2_font_wqy12_t_gb2312);
-    if (!newsValid) { u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(20, 70); u8f.print("新闻加载中..."); return; }
-    for (int i = 0; i < newsCount; ++i) {
-        int y = 52 + i * 30 + newsScrollOffset;
-        if (y < 30 || y > SCREEN_HEIGHT + 20) continue;
-        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(10, y); u8f.print(String(i + 1) + ".");
-        u8f.setForegroundColor(TFT_WHITE); drawWrappedTextCentered(newsItems[i].title, 175, y, 275, 16);
-    }
-}
-
-// 祥云县坐标（使用配置区）
-float weatherLat = WEATHER_LAT;
-float weatherLon = WEATHER_LON;
 
 // WMO天气代码转中文
 String wmoWeatherDesc(int code) {
@@ -418,21 +333,6 @@ void drawInfoContent(bool forceRefresh) {
     drawRow("Flash速度:", String(ESP.getFlashChipSpeed() / 1000000) + " MHz", TFT_WHITE);
 
     curY += 10;
-    // WiFi 信息
-    drawCard(curY - 18, 151);
-    bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    u8f.setForegroundColor(TFT_YELLOW);
-    u8f.setCursor(10, curY); u8f.print("--- WiFi 信息 ---"); curY += lineHeight;
-    drawRow("连接状态:", wifiConnected ? "已连接" : "未连接", wifiConnected ? TFT_GREEN : TFT_RED);
-    String wifiSsid = wifiConnected ? WiFi.SSID() : String(WIFI_SSID);
-    if (wifiSsid.length() == 0) wifiSsid = "未配置";
-    if (wifiSsid.length() > 28) wifiSsid = wifiSsid.substring(0, 25) + "...";
-    drawRow("SSID:", wifiSsid, TFT_WHITE);
-    drawRow("IP地址:", wifiConnected ? WiFi.localIP().toString() : "--", TFT_WHITE);
-    drawRow("信号强度:", wifiConnected ? String(WiFi.RSSI()) + " dBm" : "--", wifiConnected ? TFT_CYAN : TFT_WHITE);
-    drawRow("MAC地址:", WiFi.macAddress(), TFT_WHITE);
-
-    curY += 10;
     // 系统状态
     drawCard(curY - 18, 126);
     u8f.setForegroundColor(TFT_YELLOW);
@@ -445,88 +345,13 @@ void drawInfoContent(bool forceRefresh) {
 }
 
 void drawWeatherPage();
+void drawPcStatusPage();
+void drawFpsFullscreen();
 
 String windDirectionDesc(float degrees) {
     static const char* directions[] = {"北", "东北", "东", "东南", "南", "西南", "西", "西北"};
     int index = static_cast<int>((degrees + 22.5f) / 45.0f) % 8;
     return directions[index];
-}
-
-bool fetchWeather() {
-    if (WiFi.status() != WL_CONNECTED || weatherLoading) return false;
-
-    weatherLoading = true;
-    weatherError = "";
-    lastWeatherAttempt = millis();
-    if (currentPage == 2) drawWeatherPage();
-
-    // Open-Meteo 国际免费天气接口，无需 API Key。
-    String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(weatherLat, 4)
-        + "&longitude=" + String(weatherLon, 4)
-        + "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m"
-        + "&daily=weather_code,temperature_2m_max,temperature_2m_min"
-        + "&timezone=Asia%2FShanghai&forecast_days=7";
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.setTimeout(10000);
-    if (!http.begin(client, url)) {
-        weatherError = "无法连接天气服务";
-        weatherLoading = false;
-        return false;
-    }
-
-    int statusCode = http.GET();
-    if (statusCode != HTTP_CODE_OK) {
-        weatherError = "请求失败: " + String(statusCode);
-        http.end();
-        weatherLoading = false;
-        return false;
-    }
-
-    String responseBody = http.getString();
-    http.end();
-    DynamicJsonDocument doc(16384);
-    DeserializationError error = deserializeJson(doc, responseBody);
-    if (error) {
-        weatherError = "天气数据解析失败: " + String(error.c_str());
-        weatherLoading = false;
-        return false;
-    }
-
-    JsonObject current = doc["current"];
-    currentWeather.city = WEATHER_CITY;
-    currentWeather.temp = String(current["temperature_2m"].as<float>(), 1) + "°C";
-    currentWeather.humidity = String(current["relative_humidity_2m"].as<int>()) + "%";
-    currentWeather.windSpeed = String(current["wind_speed_10m"].as<float>(), 1) + " km/h";
-    currentWeather.windSpeedKmh = current["wind_speed_10m"].as<float>();
-    currentWeather.windDirectionDegrees = current["wind_direction_10m"].as<float>();
-    currentWeather.windDir = windDirectionDesc(currentWeather.windDirectionDegrees);
-    currentWeather.weather = wmoWeatherDesc(current["weather_code"].as<int>());
-
-    JsonObject daily = doc["daily"];
-    if (daily.isNull()) {
-        weatherError = "天气接口未返回预报";
-        weatherLoading = false;
-        return false;
-    }
-
-    for (int i = 0; i < 7; ++i) {
-        if (i >= daily.size()) {
-            forecast[i] = {"", "", "", ""};
-            continue;
-        }
-        forecast[i].date = daily["time"][i].as<String>();
-        forecast[i].high = String(daily["temperature_2m_max"][i].as<float>(), 0) + "°";
-        forecast[i].low = String(daily["temperature_2m_min"][i].as<float>(), 0) + "°";
-        forecast[i].weather = wmoWeatherDesc(daily["weather_code"][i].as<int>());
-    }
-
-    currentWeather.isValid = true;
-    weatherLoading = false;
-    lastWeatherUpdate = millis();
-    return true;
 }
 
 void refreshInfoPage() {
@@ -562,21 +387,12 @@ void drawWeatherPage() {
     u8f.setBackgroundColor(TFT_BLACK);
     u8f.setFont(u8g2_font_wqy12_t_gb2312);
 
-    if (weatherLoading) {
-        u8f.setForegroundColor(TFT_YELLOW);
-        u8f.setCursor(SCREEN_WIDTH / 2 - 40, SCREEN_HEIGHT / 2);
-        u8f.print("加载中...");
-        return;
-    }
-
     if (!currentWeather.isValid) {
-        u8f.setForegroundColor(TFT_RED);
+        u8f.setForegroundColor(TFT_YELLOW);
         u8f.setCursor(20, 60);
-        u8f.print("天气数据获取失败");
+        u8f.print("等待电脑版天气数据");
         u8f.setForegroundColor(TFT_WHITE);
         u8f.setCursor(20, 90);
-        u8f.print(weatherError);
-        u8f.setCursor(20, 120);
         u8f.print("城市: " + weatherCity);
         return;
     }
@@ -736,6 +552,81 @@ bool handleMusicControlTap(int rawX, int rawY) {
     return false;
 }
 
+bool sendPcControl(const char* action) {
+    StaticJsonDocument<96> doc;
+    doc["type"] = "pc_control";
+    doc["action"] = action;
+    serializeJson(doc, Serial);
+    Serial.println();
+    return true;
+}
+
+void drawPcControlPage() {
+    const char* labels[] = {"播放/暂停", "最小化", "最大化", "关闭窗口", "重启电脑", "关闭电脑"};
+    const uint16_t colors[] = {TFT_CYAN, TFT_GREEN, TFT_GREEN, TFT_YELLOW, TFT_ORANGE, TFT_RED};
+    tft.fillScreen(TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
+    u8f.setCursor(12, 24); u8f.print("电脑控制");
+    u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
+    if (pendingPcControlAction.length() && millis() < pendingPcControlUntil) {
+        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(105, 24); u8f.print("再次点击确认");
+    } else {
+        pendingPcControlAction = "";
+        u8f.setCursor(88, 24); u8f.print("窗口操作作用于鼠标所在窗口");
+    }
+    for (int i = 0; i < 6; ++i) {
+        int x = 8 + (i % 2) * 156;
+        int y = 38 + (i / 2) * 64;
+        tft.drawRoundRect(x, y, 148, 54, 5, colors[i]);
+        u8f.setForegroundColor(colors[i]);
+        int textWidth = u8f.getUTF8Width(labels[i]);
+        u8f.setCursor(x + (148 - textWidth) / 2, y + 33); u8f.print(labels[i]);
+    }
+}
+
+bool handlePcControlTap(int screenX, int screenY) {
+    const char* actions[] = {"media-play-pause", "minimize", "maximize", "close", "restart", "shutdown"};
+    if (screenY < 38 || screenY > 220) return false;
+    int column = screenX < 160 ? 0 : 1;
+    int row = (screenY - 38) / 64;
+    if (row < 0 || row > 2) return false;
+    if ((screenY - 38) % 64 >= 54) return false;
+    int index = row * 2 + column;
+    String action = actions[index];
+    if (index >= 4) {
+        if (pendingPcControlAction == action && millis() < pendingPcControlUntil) {
+            sendPcControl(actions[index]);
+            pendingPcControlAction = "";
+            pendingPcControlUntil = 0;
+        } else {
+            pendingPcControlAction = action;
+            pendingPcControlUntil = millis() + 4000;
+        }
+        drawPcControlPage();
+        return true;
+    }
+    pendingPcControlAction = "";
+    pendingPcControlUntil = 0;
+    return sendPcControl(actions[index]);
+}
+
+bool handlePcStatusTap(int screenX, int screenY) {
+    if (pcFpsFullscreen) {
+        pcFpsFullscreen = false;
+        pcScrollOffset = 0;
+        drawPcStatusPage();
+        return true;
+    }
+    int contentY = screenY - pcScrollOffset;
+    if (screenX >= 10 && screenX <= 78 && contentY >= 30 && contentY <= 76) {
+        pcFpsFullscreen = true;
+        drawFpsFullscreen();
+        return true;
+    }
+    return false;
+}
+
 String holidayName(int month, int day) {
     if (month == 1 && day == 1) return "元旦";
     if (month == 5 && day == 1) return "劳动节";
@@ -802,7 +693,7 @@ String formatWorldTime(time_t utcNow, int utcOffsetHours) {
 void drawWorldTimePage();
 
 void refreshWorldTimePage() {
-    if (!desktopTimeSynced && !wifiTimeSynced) return;
+    if (!desktopTimeSynced) return;
     if (!worldClockLayoutReady) {
         drawWorldTimePage();
         return;
@@ -829,7 +720,7 @@ void drawWorldTimePage() {
     u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
     u8f.setCursor(12, 22); u8f.print("世界时间（北京时间换算）");
 
-    if (!desktopTimeSynced && !wifiTimeSynced) {
+    if (!desktopTimeSynced) {
         u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_YELLOW);
         u8f.setCursor(68, 125); u8f.print("等待北京时间同步...");
         return;
@@ -927,6 +818,175 @@ void drawPcGraph(int x, int y, int width, int height, const float* values, uint1
     }
 }
 
+void drawScaledPcGraph(int x, int y, int width, int height, const float* values,
+                       float maximum, uint16_t color) {
+    tft.drawRect(x, y, width, height, tft.color565(55, 65, 78));
+    if (maximum <= 0) maximum = 100.0f;
+    for (int i = 1; i < 36; ++i) {
+        int x1 = x + 1 + (i - 1) * (width - 3) / 35;
+        int x2 = x + 1 + i * (width - 3) / 35;
+        int y1 = y + height - 2 - constrain(values[i - 1], 0.0f, maximum) * (height - 3) / maximum;
+        int y2 = y + height - 2 - constrain(values[i], 0.0f, maximum) * (height - 3) / maximum;
+        tft.drawLine(x1, y1, x2, y2, color);
+    }
+}
+
+void drawBufferedPcGraph(int x, int y, int width, int height, const float* values,
+                         float maximum, uint16_t color) {
+    if (!pcGraphSpriteReady || width > 320 || height > 105) {
+        if (maximum == 100.0f) drawPcGraph(x, y, width, height, values, color);
+        else drawScaledPcGraph(x, y, width, height, values, maximum, color);
+        return;
+    }
+    pcGraphSprite.fillSprite(TFT_BLACK);
+    pcGraphSprite.drawRect(0, 0, width, height, tft.color565(55, 65, 78));
+    if (maximum <= 0) maximum = 100.0f;
+    for (int i = 1; i < 36; ++i) {
+        int x1 = 1 + (i - 1) * (width - 3) / 35;
+        int x2 = 1 + i * (width - 3) / 35;
+        int y1 = height - 2 - constrain(values[i - 1], 0.0f, maximum) * (height - 3) / maximum;
+        int y2 = height - 2 - constrain(values[i], 0.0f, maximum) * (height - 3) / maximum;
+        pcGraphSprite.drawLine(x1, y1, x2, y2, color);
+    }
+    pcGraphSprite.pushSprite(x, y, 0, 0, width, height);
+}
+
+bool pcRegionVisible(int top, int height) {
+    return top < SCREEN_HEIGHT && top + height > 0;
+}
+
+void drawCpuCorePanel(int o, bool force) {
+    const int top = 212 + o;
+    if (force) {
+        tft.drawRoundRect(4, top, 312, 198, 6, tft.color565(55, 65, 78));
+        u8f.setFont(u8g2_font_wqy12_t_gb2312);
+        u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20); u8f.print("逻辑处理器核心占用");
+        for (int i = 0; i < 32; ++i) pcCpuCoreRendered[i] = -1;
+    }
+    int count = min(pcCpuCoreCount, 32);
+    for (int i = 0; i < count; ++i) {
+        int value = constrain(static_cast<int>(pcCpuCoreUsages[i] + 0.5f), 0, 100);
+        if (!force && value == pcCpuCoreRendered[i]) continue;
+        int column = i % 4, row = i / 4;
+        int x = 9 + column * 77, y = top + 28 + row * 20;
+        tft.fillRect(x, y, 73, 18, TFT_BLACK);
+        u8f.setForegroundColor(value >= 85 ? TFT_RED : (value >= 60 ? TFT_YELLOW : TFT_GREEN));
+        u8f.setCursor(x + 2, y + 13); u8f.print(String(i) + " " + String(value) + "%");
+        int barWidth = 20 * value / 100;
+        tft.drawRect(x + 50, y + 4, 22, 8, tft.color565(55, 65, 78));
+        if (barWidth > 0) tft.fillRect(x + 51, y + 5, barWidth, 6,
+            value >= 85 ? TFT_RED : (value >= 60 ? TFT_YELLOW : TFT_GREEN));
+        pcCpuCoreRendered[i] = value;
+    }
+}
+
+void refreshFpsFullscreen() {
+    String fpsText = pcFps >= 0 ? String(pcFps, 0) : String("--");
+    if (pcGraphSpriteReady) {
+        pcGraphSprite.fillSprite(TFT_BLACK);
+        pcGraphSprite.setTextDatum(MC_DATUM);
+        pcGraphSprite.setTextColor(pcFps >= 0 ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
+        pcGraphSprite.setTextSize(6);
+        pcGraphSprite.drawString(fpsText, SCREEN_WIDTH / 2, 49);
+        pcGraphSprite.pushSprite(0, 42, 0, 0, SCREEN_WIDTH, 105);
+    } else {
+        tft.fillRect(0, 42, SCREEN_WIDTH, 105, TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(pcFps >= 0 ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
+        tft.setTextSize(6);
+        tft.drawString(fpsText, SCREEN_WIDTH / 2, 91);
+    }
+    tft.setTextSize(1);
+    tft.fillRect(0, 148, SCREEN_WIDTH, 28, TFT_BLACK);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString((pcFrameTimeMs >= 0 ? String(pcFrameTimeMs, 2) : "--") + " ms  " + pcGraphicsApi,
+                   SCREEN_WIDTH / 2, 160);
+    drawBufferedPcGraph(10, 181, 300, 50, pcFpsHistory, 240.0f, TFT_YELLOW);
+}
+
+void drawFpsFullscreen() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2); tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("FPS", SCREEN_WIDTH / 2, 22);
+    refreshFpsFullscreen();
+}
+
+String pcSummaryValue(int index) {
+    switch (index) {
+        case 0: return pcFps >= 0 ? String(pcFps, 1) : "--";
+        case 1: return String(pcCpuUsage, 1) + "%";
+        case 2: return String(pcMemoryUsage, 1) + "%";
+        case 3: return String(pcGpuUsage, 1) + "%";
+        case 4: return String(pcCpuCurrentMHz) + "M";
+        case 5: return (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 0) : "--")
+            + "/" + (pcGpuPowerWatts >= 0 ? String(pcGpuPowerWatts, 0) : "--") + "W";
+        case 6: return String(pcGpuDedicatedUsedMBs[0]) + "M";
+        case 7: return pcGpuFanRpms[0] >= 0 ? String(pcGpuFanRpms[0]) + "R"
+            : (pcGpuFanPercents[0] >= 0 ? String(pcGpuFanPercents[0]) + "%" : "--");
+        default: return "--";
+    }
+}
+
+void drawPcSummaryCards(int o) {
+    const char* labels[] = {"FPS", "CPU", "内存", "GPU", "CPU频率", "CPU/GPU功率", "显存", "风扇"};
+    const uint16_t colors[] = {TFT_YELLOW, TFT_GREEN, TFT_MAGENTA, TFT_CYAN,
+        TFT_GREEN, TFT_YELLOW, TFT_MAGENTA, TFT_CYAN};
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    tft.drawRoundRect(4, 5 + o, 154, 130, 6, tft.color565(55, 65, 78));
+    tft.drawRoundRect(162, 5 + o, 154, 130, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(10, 23 + o); u8f.print("实时状态");
+    u8f.setCursor(168, 23 + o); u8f.print("硬件状态");
+    for (int i = 0; i < 8; ++i) {
+        int groupX = i < 4 ? 4 : 162;
+        int local = i % 4;
+        int x = groupX + 6 + (local % 2) * 72;
+        int y = 30 + (local / 2) * 50 + o;
+        tft.drawRoundRect(x, y, 68, 46, 4, tft.color565(42, 52, 65));
+        u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(x + 5, y + 15); u8f.print(labels[i]);
+        u8f.setForegroundColor(colors[i]); u8f.setCursor(x + 5, y + 38);
+        pcSummaryRenderedValues[i] = pcSummaryValue(i);
+        u8f.print(pcSummaryRenderedValues[i]);
+    }
+    tft.drawRoundRect(4, 140 + o, 312, 66, 6, tft.color565(55, 65, 78));
+    const char* graphicsLabels[] = {"图形 API", "帧延迟"};
+    pcGraphicsRenderedValues[0] = pcGraphicsApi;
+    pcGraphicsRenderedValues[1] = pcFrameTimeMs >= 0 ? String(pcFrameTimeMs, 2) + " ms" : "-- ms";
+    for (int i = 0; i < 2; ++i) {
+        int x = 10 + i * 154;
+        tft.drawRoundRect(x, 147 + o, 146, 52, 4, tft.color565(42, 52, 65));
+        u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(x + 7, 164 + o); u8f.print(graphicsLabels[i]);
+        u8f.setForegroundColor(i == 0 ? TFT_CYAN : TFT_YELLOW);
+        u8f.setCursor(x + 7, 190 + o); u8f.print(pcGraphicsRenderedValues[i]);
+    }
+}
+
+void refreshPcSummaryCards(int o) {
+    const uint16_t colors[] = {TFT_YELLOW, TFT_GREEN, TFT_MAGENTA, TFT_CYAN,
+        TFT_GREEN, TFT_YELLOW, TFT_MAGENTA, TFT_CYAN};
+    for (int i = 0; i < 8; ++i) {
+        String value = pcSummaryValue(i);
+        if (value == pcSummaryRenderedValues[i]) continue;
+        int groupX = i < 4 ? 4 : 162;
+        int local = i % 4;
+        int x = groupX + 6 + (local % 2) * 72;
+        int y = 30 + (local / 2) * 50 + o;
+        tft.fillRect(x + 2, y + 19, 64, 25, TFT_BLACK);
+        u8f.setForegroundColor(colors[i]); u8f.setCursor(x + 5, y + 38); u8f.print(value);
+        pcSummaryRenderedValues[i] = value;
+    }
+    String graphicsValues[] = {pcGraphicsApi,
+        pcFrameTimeMs >= 0 ? String(pcFrameTimeMs, 2) + " ms" : "-- ms"};
+    for (int i = 0; i < 2; ++i) {
+        if (graphicsValues[i] == pcGraphicsRenderedValues[i]) continue;
+        int x = 10 + i * 154;
+        tft.fillRect(x + 2, 168 + o, 142, 29, TFT_BLACK);
+        u8f.setForegroundColor(i == 0 ? TFT_CYAN : TFT_YELLOW);
+        u8f.setCursor(x + 7, 190 + o); u8f.print(graphicsValues[i]);
+        pcGraphicsRenderedValues[i] = graphicsValues[i];
+    }
+}
+
 void cachePcRenderedValues() {
     pcRenderedValues[0] = pcCpuName.substring(0, 28);
     pcRenderedValues[1] = String(pcCpuUsage, 1) + "%";
@@ -934,71 +994,97 @@ void cachePcRenderedValues() {
     pcRenderedValues[3] = String(pcCpuCurrentMHz) + " MHz  "
         + (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 1) + " W" : "-- W");
     pcRenderedValues[4] = pcGpuName.substring(0, 31);
-    pcRenderedValues[5] = String(pcGpuUsage, 1) + "%";
+    pcRenderedValues[5] = String(pcGpuUsage, 1) + "%  "
+        + (pcFps >= 0 ? String(pcFps, 1) + " FPS" : "FPS --");
     pcRenderedValues[6] = "显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB";
-    pcRenderedValues[7] = pcGpuFanPercents[0] >= 0
-        ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用";
+    pcRenderedValues[7] = pcGpuFanRpms[0] >= 0
+        ? "风扇 " + String(pcGpuFanRpms[0]) + " RPM"
+        : (pcGpuFanPercents[0] >= 0 ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用");
     pcRenderedValues[8] = "内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB";
     pcRenderedValues[9] = "占用 " + String(pcMemoryUsage, 1) + "%";
 }
 
 void refreshPcStatusPage() {
+    if (pcFpsFullscreen) {
+        refreshFpsFullscreen();
+        pcStatusDirty = false;
+        lastPcStatusDraw = millis();
+        return;
+    }
     int o = pcScrollOffset;
     String values[10] = {
         pcCpuName.substring(0, 28), String(pcCpuUsage, 1) + "%",
         String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程",
         String(pcCpuCurrentMHz) + " MHz  "
             + (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 1) + " W" : "-- W"), pcGpuName.substring(0, 31),
-        String(pcGpuUsage, 1) + "%", "显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB",
-        pcGpuFanPercents[0] >= 0 ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用",
+        String(pcGpuUsage, 1) + "%  " + (pcFps >= 0 ? String(pcFps, 1) + " FPS" : "FPS --"),
+        "显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB",
+        pcGpuFanRpms[0] >= 0 ? "风扇 " + String(pcGpuFanRpms[0]) + " RPM"
+            : (pcGpuFanPercents[0] >= 0 ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用"),
         "内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB",
         "占用 " + String(pcMemoryUsage, 1) + "%"
     };
     const int x[10] = {70, 14, 14, 14, 55, 14, 14, 14, 14, 14};
-    const int y[10] = {24, 57, 82, 103, 142, 176, 202, 222, 292, 316};
+    const int y[10] = {24 + PC_DETAIL_OFFSET, 57 + PC_DETAIL_OFFSET,
+        82 + PC_DETAIL_OFFSET, 103 + PC_DETAIL_OFFSET, 142 + PC_DETAIL_OFFSET,
+        176 + PC_DETAIL_OFFSET, 202 + PC_DETAIL_OFFSET, 222 + PC_DETAIL_OFFSET,
+        292 + PC_DETAIL_OFFSET, 316 + PC_DETAIL_OFFSET};
     const int width[10] = {238, 105, 105, 105, 253, 105, 105, 105, 292, 292};
     const uint16_t color[10] = {TFT_WHITE, TFT_GREEN, TFT_LIGHTGREY, TFT_LIGHTGREY,
         TFT_WHITE, TFT_CYAN, TFT_LIGHTGREY, TFT_LIGHTGREY, TFT_WHITE, TFT_CYAN};
 
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    if (pcRegionVisible(o, 206)) refreshPcSummaryCards(o);
+    if (pcRegionVisible(212 + o, 198)) drawCpuCorePanel(o, false);
     for (int i = 0; i < 10; ++i) {
+        if (!pcRegionVisible(y[i] - 18 + o, 22)) continue;
         if (values[i] == pcRenderedValues[i]) continue;
         tft.fillRect(x[i] - 2, y[i] - 16 + o, width[i], 19, TFT_BLACK);
         u8f.setForegroundColor(color[i]);
         u8f.setCursor(x[i], y[i] + o); u8f.print(values[i]);
         pcRenderedValues[i] = values[i];
     }
-    tft.fillRect(124, 41 + o, 180, 62, TFT_BLACK);
-    drawPcGraph(125, 42 + o, 178, 58, pcCpuHistory, TFT_GREEN);
-    tft.fillRect(124, 158 + o, 180, 63, TFT_BLACK);
-    drawPcGraph(125, 159 + o, 178, 60, pcGpuHistory, TFT_CYAN);
+    if (pcRegionVisible(42 + PC_DETAIL_OFFSET + o, 58))
+        drawBufferedPcGraph(125, 42 + PC_DETAIL_OFFSET + o, 178, 58, pcCpuHistory, 100.0f, TFT_GREEN);
+    if (pcRegionVisible(159 + PC_DETAIL_OFFSET + o, 60))
+        drawBufferedPcGraph(125, 159 + PC_DETAIL_OFFSET + o, 178, 60, pcGpuHistory, 100.0f, TFT_CYAN);
 
     static String renderedDisk;
     if (renderedDisk != pcDiskSummary) {
-        tft.fillRect(12, 322 + o, 296, 19, TFT_BLACK);
-        u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + o); u8f.print(pcDiskSummary);
+        tft.fillRect(12, 322 + PC_DETAIL_OFFSET + o, 296, 19, TFT_BLACK);
+        u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + PC_DETAIL_OFFSET + o); u8f.print(pcDiskSummary);
         renderedDisk = pcDiskSummary;
     }
-    static String renderedGpuRows[4];
+    static String renderedGpuIdentity[4];
+    static String renderedGpuMetrics[4];
     if (pcGpuCount > 0) {
         for (int i = 0; i < pcGpuCount; ++i) {
-            String signature = pcGpuNames[i] + pcGpuVendors[i] + String(pcGpuUsages[i], 1)
+            String identity = pcGpuNames[i] + pcGpuDriverVersions[i] + pcGpuDriverDates[i];
+            String metrics = pcGpuVendors[i] + String(pcGpuUsages[i], 1)
                 + String(pcGpuDedicatedUsedMBs[i]) + String(pcGpuSharedUsedMBs[i])
-                + String(pcGpuFanPercents[i])
-                + pcGpuDriverVersions[i] + pcGpuDriverDates[i];
-            if (signature == renderedGpuRows[i]) continue;
-            int top = 382 + i * 118 + o;
-            tft.fillRect(9, top + 1, 302, 109, TFT_BLACK);
-            u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20);
-            u8f.print(String(i + 1) + ". " + pcGpuNames[i].substring(0, 28));
-            u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(12, top + 42);
-            u8f.print(pcGpuVendors[i].substring(0, 15) + " 占用 " + String(pcGpuUsages[i], 1) + "% "
-                + (pcGpuFanPercents[i] >= 0 ? "风扇 " + String(pcGpuFanPercents[i]) + "%" : "风扇不可用"));
-            u8f.setCursor(12, top + 64); u8f.print("独显已用 " + String(pcGpuDedicatedUsedMBs[i]) + " MB");
-            u8f.setCursor(12, top + 86); u8f.print("共享 " + String(pcGpuSharedUsedMBs[i]) + " MB");
-            u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(12, top + 107);
-            u8f.print("驱动 " + pcGpuDriverVersions[i].substring(0, 18) + " " + pcGpuDriverDates[i]);
-            renderedGpuRows[i] = signature;
+                + String(pcGpuFanPercents[i]) + String(pcGpuFanRpms[i]);
+            int top = 382 + PC_DETAIL_OFFSET + i * 180 + o;
+            if (!pcRegionVisible(top, 170)) continue;
+            if (identity != renderedGpuIdentity[i]) {
+                tft.fillRect(10, top + 3, 300, 20, TFT_BLACK);
+                u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20);
+                u8f.print(String(i + 1) + ". " + pcGpuNames[i].substring(0, 28));
+                tft.fillRect(10, top + 90, 300, 20, TFT_BLACK);
+                u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(12, top + 107);
+                u8f.print("驱动 " + pcGpuDriverVersions[i].substring(0, 18) + " " + pcGpuDriverDates[i]);
+                renderedGpuIdentity[i] = identity;
+            }
+            if (metrics != renderedGpuMetrics[i]) {
+                tft.fillRect(10, top + 25, 300, 64, TFT_BLACK);
+                u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(12, top + 42);
+                u8f.print(pcGpuVendors[i].substring(0, 15) + " 核心 " + String(pcGpuUsages[i], 1) + "% "
+                    + (pcGpuFanRpms[i] >= 0 ? "风扇 " + String(pcGpuFanRpms[i]) + "RPM"
+                        : (pcGpuFanPercents[i] >= 0 ? "风扇 " + String(pcGpuFanPercents[i]) + "%" : "风扇不可用")));
+                u8f.setCursor(12, top + 64); u8f.print("独显已用 " + String(pcGpuDedicatedUsedMBs[i]) + " MB");
+                u8f.setCursor(12, top + 86); u8f.print("共享 " + String(pcGpuSharedUsedMBs[i]) + " MB");
+                renderedGpuMetrics[i] = metrics;
+            }
+            drawBufferedPcGraph(12, top + 114, 296, 50, pcGpuHistories[i], 100.0f, TFT_CYAN);
         }
     }
     pcStatusDirty = false;
@@ -1006,50 +1092,63 @@ void refreshPcStatusPage() {
 }
 
 void drawPcStatusPage() {
+    if (pcFpsFullscreen) {
+        drawFpsFullscreen();
+        return;
+    }
     tft.fillScreen(TFT_BLACK);
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
     int o = pcScrollOffset;
+    int d = PC_DETAIL_OFFSET;
 
-    tft.drawRoundRect(4, 5 + o, 312, 110, 6, tft.color565(55, 65, 78));
-    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, 24 + o); u8f.print("处理器");
-    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(70, 24 + o); u8f.print(pcCpuName.substring(0, 28));
-    u8f.setForegroundColor(TFT_GREEN); u8f.setCursor(14, 57 + o); u8f.print(String(pcCpuUsage, 1) + "%");
-    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 82 + o);
+    drawPcSummaryCards(o);
+    drawCpuCorePanel(o, true);
+
+    tft.drawRoundRect(4, 5 + d + o, 312, 110, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, 24 + d + o); u8f.print("处理器");
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(70, 24 + d + o); u8f.print(pcCpuName.substring(0, 28));
+    u8f.setForegroundColor(TFT_GREEN); u8f.setCursor(14, 57 + d + o); u8f.print(String(pcCpuUsage, 1) + "%");
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 82 + d + o);
     u8f.print(String(pcCpuPhysicalCores) + "核/" + String(pcCpuCores) + "线程");
-    u8f.setCursor(14, 103 + o); u8f.print(String(pcCpuCurrentMHz) + " MHz  "
+    u8f.setCursor(14, 103 + d + o); u8f.print(String(pcCpuCurrentMHz) + " MHz  "
         + (pcCpuPowerWatts >= 0 ? String(pcCpuPowerWatts, 1) + " W" : "-- W"));
-    drawPcGraph(125, 42 + o, 178, 58, pcCpuHistory, TFT_GREEN);
+    drawPcGraph(125, 42 + d + o, 178, 58, pcCpuHistory, TFT_GREEN);
 
-    tft.drawRoundRect(4, 122 + o, 312, 113, 6, tft.color565(55, 65, 78));
-    u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 142 + o); u8f.print("显卡");
-    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(55, 142 + o); u8f.print(pcGpuName.substring(0, 31));
-    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 176 + o); u8f.print(String(pcGpuUsage, 1) + "%");
-    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 202 + o);
+    tft.drawRoundRect(4, 122 + d + o, 312, 113, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 142 + d + o); u8f.print("显卡");
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(55, 142 + d + o); u8f.print(pcGpuName.substring(0, 31));
+    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 176 + d + o);
+    u8f.print(String(pcGpuUsage, 1) + "%  " + (pcFps >= 0 ? String(pcFps, 1) + " FPS" : "FPS --"));
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 202 + d + o);
     u8f.print("显存已用 " + String(pcGpuDedicatedUsedMBs[0]) + " MB");
-    u8f.setCursor(14, 222 + o); u8f.print(pcGpuFanPercents[0] >= 0
-        ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用");
-    drawPcGraph(125, 159 + o, 178, 60, pcGpuHistory, TFT_CYAN);
+    u8f.setCursor(14, 222 + d + o); u8f.print(pcGpuFanRpms[0] >= 0
+        ? "风扇 " + String(pcGpuFanRpms[0]) + " RPM"
+        : (pcGpuFanPercents[0] >= 0 ? "风扇 " + String(pcGpuFanPercents[0]) + "%" : "风扇不可用"));
+    drawPcGraph(125, 159 + d + o, 178, 60, pcGpuHistory, TFT_CYAN);
 
-    tft.drawRoundRect(4, 242 + o, 312, 105, 6, tft.color565(55, 65, 78));
-    u8f.setForegroundColor(TFT_MAGENTA); u8f.setCursor(12, 264 + o); u8f.print("内存与磁盘");
-    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(14, 292 + o); u8f.print("内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB");
-    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 316 + o); u8f.print("占用 " + String(pcMemoryUsage, 1) + "%");
-    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + o); u8f.print(pcDiskSummary);
+    tft.drawRoundRect(4, 242 + d + o, 312, 105, 6, tft.color565(55, 65, 78));
+    u8f.setForegroundColor(TFT_MAGENTA); u8f.setCursor(12, 264 + d + o); u8f.print("内存与磁盘");
+    u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(14, 292 + d + o); u8f.print("内存 " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB");
+    u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(14, 316 + d + o); u8f.print("占用 " + String(pcMemoryUsage, 1) + "%");
+    u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(14, 338 + d + o); u8f.print(pcDiskSummary);
     if (pcGpuCount > 0) {
-        int cardHeight = 35 + pcGpuCount * 118;
-        tft.drawRoundRect(4, 354 + o, 312, cardHeight, 6, tft.color565(55, 65, 78));
-        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 375 + o); u8f.print("显卡详细状态");
+        int cardHeight = 35 + pcGpuCount * 180;
+        tft.drawRoundRect(4, 354 + d + o, 312, cardHeight, 6, tft.color565(55, 65, 78));
+        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(12, 375 + d + o); u8f.print("显卡详细状态");
         for (int i = 0; i < pcGpuCount; ++i) {
-            int top = 382 + i * 118 + o;
+            int top = 382 + d + i * 180 + o;
+            if (!pcRegionVisible(top, 170)) continue;
             u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20);
             u8f.print(String(i + 1) + ". " + pcGpuNames[i].substring(0, 28));
             u8f.setForegroundColor(TFT_WHITE); u8f.setCursor(12, top + 42);
-            u8f.print(pcGpuVendors[i].substring(0, 15) + " 占用 " + String(pcGpuUsages[i], 1) + "% "
-                + (pcGpuFanPercents[i] >= 0 ? "风扇 " + String(pcGpuFanPercents[i]) + "%" : "风扇不可用"));
+            u8f.print(pcGpuVendors[i].substring(0, 15) + " 核心 " + String(pcGpuUsages[i], 1) + "% "
+                + (pcGpuFanRpms[i] >= 0 ? "风扇 " + String(pcGpuFanRpms[i]) + "RPM"
+                    : (pcGpuFanPercents[i] >= 0 ? "风扇 " + String(pcGpuFanPercents[i]) + "%" : "风扇不可用")));
             u8f.setCursor(12, top + 64); u8f.print("独显已用 " + String(pcGpuDedicatedUsedMBs[i]) + " MB");
             u8f.setCursor(12, top + 86); u8f.print("共享 " + String(pcGpuSharedUsedMBs[i]) + " MB");
             u8f.setForegroundColor(TFT_LIGHTGREY); u8f.setCursor(12, top + 107);
             u8f.print("驱动 " + pcGpuDriverVersions[i].substring(0, 18) + " " + pcGpuDriverDates[i]);
+            drawPcGraph(12, top + 114, 296, 50, pcGpuHistories[i], TFT_CYAN);
         }
     }
     cachePcRenderedValues();
@@ -1118,7 +1217,7 @@ void drawDisplay() {
     } else if (currentPage == 2) {
         drawWeatherPage();
     } else if (currentPage == 3) {
-        drawNewsPage();
+        drawPcControlPage();
     } else if (currentPage == 4) {
         drawCalendarPage();
     } else if (currentPage == 5) {
@@ -1182,12 +1281,8 @@ void sendDesktopTelemetry() {
     doc["flashSpeed"] = ESP.getFlashChipSpeed();
     doc["temperature"] = temperatureRead();
     doc["uptimeSeconds"] = millis() / 1000;
-    doc["timeSynced"] = desktopTimeSynced || wifiTimeSynced;
-    doc["timeSource"] = activeTimeSource == TimeSource::WIFI_NTP
-        ? "wifi-ntp"
-        : (activeTimeSource == TimeSource::DESKTOP ? "ntp-via-com" : "unsynced");
-    doc["wifiConnected"] = WiFi.status() == WL_CONNECTED;
-    doc["wifiRssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+    doc["timeSynced"] = desktopTimeSynced;
+    doc["timeSource"] = activeTimeSource == TimeSource::DESKTOP ? "pc-via-com" : "unsynced";
     doc["date"] = currentDateStr;
     doc["time"] = currentTimeStr;
     serializeJson(doc, Serial);
@@ -1195,7 +1290,7 @@ void sendDesktopTelemetry() {
 }
 
 void handleDesktopCommand(const String& line) {
-    DynamicJsonDocument doc(6144);
+    DynamicJsonDocument doc(8192);
     DeserializationError error = deserializeJson(doc, line);
     if (error) return;
 
@@ -1217,25 +1312,101 @@ void handleDesktopCommand(const String& line) {
         screenHidden = true;
         digitalWrite(TFT_BL, LOW);
         sendDesktopAck(cmd, "屏幕已关闭，点击屏幕唤醒");
+    } else if (strcmp(cmd, "screen_on") == 0) {
+        screenHidden = false;
+        lastInteractionMillis = millis();
+        digitalWrite(TFT_BL, HIGH);
+        drawDisplay();
+        sendDesktopAck(cmd, "屏幕已开启");
+    } else if (strcmp(cmd, "set_page") == 0) {
+        int requestedPage = constrain(doc["page"] | 0, 0, MAX_PAGES - 1);
+        if (requestedPage != 6) pcFpsFullscreen = false;
+        if (requestedPage != 0) {
+            lyricActive = false;
+            currentLyric = "";
+            currentTranslation = "";
+        }
+        currentPage = requestedPage;
+        scrollOffset = 0;
+        weatherScrollOffset = 0;
+        pcScrollOffset = 0;
+        lastTimeStr = "";
+        screenHidden = false;
+        lastInteractionMillis = millis();
+        digitalWrite(TFT_BL, HIGH);
+        drawDisplay();
+        sendDesktopAck(cmd, "页面已切换");
+    } else if (strcmp(cmd, "weather_update") == 0) {
+        JsonObject current = doc["current"];
+        JsonArray daily = doc["daily"];
+        if (current.isNull() || daily.size() < 7) {
+            sendDesktopAck(cmd, "电脑版天气数据无效");
+            return;
+        }
+        weatherCity = doc["city"] | WEATHER_CITY;
+        currentWeather.city = weatherCity;
+        currentWeather.temp = String(current["temperature"].as<float>(), 1) + "°C";
+        currentWeather.humidity = String(current["humidity"].as<int>()) + "%";
+        currentWeather.windSpeedKmh = current["windSpeed"] | 0.0f;
+        currentWeather.windSpeed = String(currentWeather.windSpeedKmh, 1) + " km/h";
+        currentWeather.windDirectionDegrees = current["windDirection"] | 0.0f;
+        currentWeather.windDir = windDirectionDesc(currentWeather.windDirectionDegrees);
+        currentWeather.weather = wmoWeatherDesc(current["weatherCode"] | -1);
+        for (int i = 0; i < 7; ++i) {
+            forecast[i].date = daily[i]["date"].as<String>();
+            forecast[i].high = String(daily[i]["high"].as<float>(), 0) + "°";
+            forecast[i].low = String(daily[i]["low"].as<float>(), 0) + "°";
+            forecast[i].weather = wmoWeatherDesc(daily[i]["weatherCode"] | -1);
+        }
+        currentWeather.isValid = true;
+        if (currentPage == 2 && !screenHidden) drawWeatherPage();
+        sendDesktopAck(cmd, "电脑版天气已更新");
     } else if (strcmp(cmd, "pc_status") == 0) {
-        pcCpuName = doc["cpuName"].as<String>();
-        pcGpuName = doc["gpuName"].as<String>();
-        pcCpuUsage = doc["cpuUsage"] | 0.0f;
-        pcGpuUsage = doc["gpuUsage"] | 0.0f;
-        pcCpuCores = doc["cpuCores"] | 0;
-        pcCpuPhysicalCores = doc["cpuPhysicalCores"] | 0;
-        pcCpuMaxMHz = doc["cpuMaxMHz"] | 0;
-        pcCpuCurrentMHz = doc["cpuCurrentMHz"] | pcCpuMaxMHz;
-        pcCpuPowerWatts = doc["cpuPowerWatts"] | -1.0f;
-        pcMemoryUsedMB = doc["memoryUsedMB"] | 0;
-        pcMemoryTotalMB = doc["memoryTotalMB"] | 0;
-        pcMemoryUsage = doc["memoryUsage"] | 0.0f;
-        pcGpuMemoryMB = doc["gpuMemoryMB"] | 0;
-        pcGpuFanPercents[0] = doc["gpuFanPercent"] | -1;
-        pcGpuDriver = doc["gpuDriver"].as<String>();
+        bool pauseCpu = doc["pauseCpu"] | false;
+        bool pauseMemory = doc["pauseMemory"] | false;
+        bool pauseGpu = doc["pauseGpu"] | false;
+        bool pauseFps = doc["pauseFps"] | false;
+        if (!pauseCpu) {
+            pcCpuName = doc["cpuName"].as<String>();
+            pcCpuUsage = doc["cpuUsage"] | 0.0f;
+            pcCpuCores = doc["cpuCores"] | 0;
+            pcCpuPhysicalCores = doc["cpuPhysicalCores"] | 0;
+            pcCpuMaxMHz = doc["cpuMaxMHz"] | 0;
+            pcCpuCurrentMHz = doc["cpuCurrentMHz"] | pcCpuMaxMHz;
+            pcCpuPowerWatts = doc["cpuPowerWatts"] | -1.0f;
+            JsonArray coreUsages = doc["cpuCoreUsages"].as<JsonArray>();
+            if (!coreUsages.isNull()) {
+                pcCpuCoreCount = 0;
+                for (JsonVariant usage : coreUsages) {
+                    if (pcCpuCoreCount >= 32) break;
+                    pcCpuCoreUsages[pcCpuCoreCount++] = usage.as<float>();
+                }
+            }
+        }
+        if (!pauseMemory) {
+            pcMemoryUsedMB = doc["memoryUsedMB"] | 0;
+            pcMemoryTotalMB = doc["memoryTotalMB"] | 0;
+            pcMemoryUsage = doc["memoryUsage"] | 0.0f;
+        }
+        if (!pauseGpu) {
+            pcGpuName = doc["gpuName"].as<String>();
+            pcGpuUsage = doc["gpuUsage"] | 0.0f;
+            pcGpuMemoryMB = doc["gpuMemoryMB"] | 0;
+            pcGpuFanPercents[0] = doc["gpuFanPercent"] | -1;
+            pcGpuFanRpms[0] = doc["gpuFanRpm"] | -1;
+            pcGpuPowerWatts = doc["gpuPowerWatts"] | -1.0f;
+            pcGpuDriver = doc["gpuDriver"].as<String>();
+        }
+        if (!pauseFps) {
+            pcFps = doc["fps"] | -1.0f;
+            pcFrameTimeMs = doc["frameTimeMs"] | -1.0f;
+            pcGraphicsApi = doc["graphicsApi"] | "--";
+            for (int i = 0; i < 35; ++i) pcFpsHistory[i] = pcFpsHistory[i + 1];
+            pcFpsHistory[35] = max(pcFps, 0.0f);
+        }
         JsonArray gpuArray = doc["gpus"].as<JsonArray>();
-        pcGpuCount = 0;
-        if (!gpuArray.isNull()) {
+        if (!pauseGpu && !gpuArray.isNull()) {
+            pcGpuCount = 0;
             for (JsonObject gpu : gpuArray) {
                 if (pcGpuCount >= 4) break;
                 pcGpuNames[pcGpuCount] = gpu["name"].as<String>();
@@ -1247,6 +1418,8 @@ void handleDesktopCommand(const String& line) {
                 pcGpuSharedUsedMBs[pcGpuCount] = gpu["sharedUsedMB"] | 0;
                 pcGpuUsages[pcGpuCount] = gpu["usage"] | 0.0f;
                 pcGpuFanPercents[pcGpuCount] = gpu["fanPercent"] | -1;
+                pcGpuFanRpms[pcGpuCount] = gpu["fanRpm"] | -1;
+                pcGpuPowerWattValues[pcGpuCount] = gpu["powerWatts"] | -1.0f;
                 ++pcGpuCount;
             }
         }
@@ -1259,17 +1432,23 @@ void handleDesktopCommand(const String& line) {
             pcSyncLatencyMs = static_cast<unsigned long>(latencyMs > 9999ULL ? 9999ULL : latencyMs);
         }
         JsonArray disks = doc["disks"].as<JsonArray>();
-        if (!disks.isNull() && disks.size() > 0) {
+        if (!pauseMemory && !disks.isNull() && disks.size() > 0) {
             int freeMB = disks[0]["freeMB"] | 0;
             int totalMB = disks[0]["totalMB"] | 0;
             pcDiskSummary = disks[0]["name"].as<String>() + " " + String(freeMB / 1024.0f, 1) + "/" + String(totalMB / 1024.0f, 1) + " GB 可用";
         }
-        for (int i = 0; i < 35; ++i) {
-            pcCpuHistory[i] = pcCpuHistory[i + 1];
-            pcGpuHistory[i] = pcGpuHistory[i + 1];
+        if (!pauseCpu) {
+            for (int i = 0; i < 35; ++i) pcCpuHistory[i] = pcCpuHistory[i + 1];
+            pcCpuHistory[35] = pcCpuUsage;
         }
-        pcCpuHistory[35] = pcCpuUsage;
-        pcGpuHistory[35] = pcGpuUsage;
+        if (!pauseGpu) {
+            for (int i = 0; i < 35; ++i) pcGpuHistory[i] = pcGpuHistory[i + 1];
+            pcGpuHistory[35] = pcGpuUsage;
+            for (int gpu = 0; gpu < pcGpuCount; ++gpu) {
+                for (int i = 0; i < 35; ++i) pcGpuHistories[gpu][i] = pcGpuHistories[gpu][i + 1];
+                pcGpuHistories[gpu][35] = pcGpuUsages[gpu];
+            }
+        }
         pcStatusDirty = true;
     } else if (strcmp(cmd, "reboot") == 0) {
         sendDesktopAck(cmd, "设备正在重启");
@@ -1285,57 +1464,16 @@ void readDesktopCommands() {
             desktopCommandBuffer.trim();
             if (desktopCommandBuffer.length() > 0) handleDesktopCommand(desktopCommandBuffer);
             desktopCommandBuffer = "";
-        } else if (c != '\r' && desktopCommandBuffer.length() < 4096) {
+        } else if (c != '\r' && desktopCommandBuffer.length() < 6144) {
             desktopCommandBuffer += c;
         }
     }
 }
 
-void onWifiNtpSync(struct timeval*) {
-    wifiNtpSyncPending = true;
-}
-
-void startWifiConnection() {
-    if (strlen(WIFI_SSID) == 0) return;
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiConnectAttempt = millis();
-}
-
-void maintainWifiTimeSync() {
-    if (strlen(WIFI_SSID) == 0) return;
-
-    if (WiFi.status() != WL_CONNECTED) {
-        wifiNtpStarted = false;
-        if (millis() - lastWifiConnectAttempt >= WIFI_RECONNECT_INTERVAL) {
-            WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-            lastWifiConnectAttempt = millis();
-        }
-        return;
-    }
-
-    if (!wifiNtpStarted) {
-        sntp_set_time_sync_notification_cb(onWifiNtpSync);
-        configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
-        wifiNtpStarted = true;
-    }
-
-    if (wifiNtpSyncPending) {
-        wifiNtpSyncPending = false;
-        wifiTimeSynced = true;
-        activeTimeSource = TimeSource::WIFI_NTP;
-    }
-}
-
 void updateTimeFromSystemClock() {
-    if (!desktopTimeSynced && !wifiTimeSynced) return;
+    if (!desktopTimeSynced) return;
     time_t utcNow = time(nullptr);
-    long utcOffsetSeconds = activeTimeSource == TimeSource::DESKTOP
-        ? desktopUtcOffsetSeconds
-        : LOCAL_UTC_OFFSET_SECONDS;
-    time_t localNow = utcNow + utcOffsetSeconds;
+    time_t localNow = utcNow + desktopUtcOffsetSeconds;
     struct tm current;
     gmtime_r(&localNow, &current);
     char timeBuffer[12];
@@ -1350,13 +1488,14 @@ void setup() {
     Serial.begin(115200);
     timerPreferences.begin("timer", false);
     loadTimerMemory();
-    desktopCommandBuffer.reserve(4096);
+    desktopCommandBuffer.reserve(6144);
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
     SPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI);
     touchscreen.begin(); touchscreen.setRotation(1);
     tft.init(); tft.setRotation(1); tft.fillScreen(TFT_BLACK); u8f.begin(tft);
+    pcGraphSprite.setColorDepth(8);
+    pcGraphSpriteReady = pcGraphSprite.createSprite(320, 105) != nullptr;
     lastInteractionMillis = millis();
-    startWifiConnection();
     drawDisplay();
     sendDesktopTelemetry();
 }
@@ -1365,20 +1504,6 @@ void loop() {
     unsigned long loopStart = micros();
 
     readDesktopCommands();
-    maintainWifiTimeSync();
-    if (WiFi.status() == WL_CONNECTED) {
-        bool updateDue = currentWeather.isValid
-            ? millis() - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL
-            : millis() - lastWeatherAttempt >= WEATHER_RETRY_INTERVAL || lastWeatherAttempt == 0;
-        if (updateDue) {
-            fetchWeather();
-            if (currentPage == 2) drawWeatherPage();
-        }
-        if (millis() - lastNewsUpdate >= 900000UL || (!newsValid && lastNewsUpdate == 0)) {
-            fetchNews();
-            if (currentPage == 3) drawNewsPage();
-        }
-    }
     if (millis() - lastTimeUpdate >= 1000) {
         if (!lyricActive) updateTimeFromSystemClock();
         if (currentPage == 0 && !lyricActive) {
@@ -1394,8 +1519,9 @@ void loop() {
         lastInfoUpdate = millis();
     }
 
+    unsigned long pcRefreshInterval = pcFpsFullscreen ? 100UL : 250UL;
     if (currentPage == 6 && pcStatusDirty && !screenHidden
-        && millis() - lastPcStatusDraw >= 300) {
+        && millis() - lastPcStatusDraw >= pcRefreshInterval) {
         refreshPcStatusPage();
         pcStatusDirty = false;
         lastPcStatusDraw = millis();
@@ -1431,7 +1557,14 @@ void loop() {
         saveTimerMemory();
     }
 
-    if (currentPage == 2 && currentWeather.isValid && !weatherLoading) {
+    if (currentPage == 3 && pendingPcControlAction.length()
+        && millis() >= pendingPcControlUntil) {
+        pendingPcControlAction = "";
+        pendingPcControlUntil = 0;
+        drawPcControlPage();
+    }
+
+    if (currentPage == 2 && currentWeather.isValid) {
         unsigned long animationInterval = static_cast<unsigned long>(constrain(260.0f - currentWeather.windSpeedKmh * 8.0f, 70.0f, 260.0f));
         if (millis() - lastWindAnimation >= animationInterval) {
             windAnimationPhase = (windAnimationPhase + 3) % 27;
@@ -1483,23 +1616,15 @@ void loop() {
                     drawDisplay();
                     startY = p.y;
                     isSwiping = true;
-                } else if (currentPage == 3 && abs(dy) > abs(dx) && abs(dy) > 200) {
-                    if (newsDetail) {
-                        newsDetailScrollOffset += dy / 20;
-                        newsDetailScrollOffset = constrain(newsDetailScrollOffset, -100, 0);
-                    } else {
-                    newsScrollOffset += dy / 20;
-                    int maxScroll = max(0, newsCount * 30 - 180);
-                    newsScrollOffset = constrain(newsScrollOffset, -maxScroll, 0);
-                    }
-                    drawDisplay();
-                    startY = p.y;
-                    isSwiping = true;
-                } else if (currentPage == 6 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                } else if (currentPage == 6 && !pcFpsFullscreen
+                           && abs(dy) > abs(dx) && abs(dy) > 200) {
                     pcScrollOffset += dy / 20;
                     pcScrollOffset = constrain(pcScrollOffset,
-                        pcGpuCount > 0 ? -(pcGpuCount * 118 + 160) : -115, 0);
-                    drawDisplay();
+                        pcGpuCount > 0 ? -(pcGpuCount * 180 + 570) : -530, 0);
+                    if (millis() - lastPcScrollDraw >= 80) {
+                        drawDisplay();
+                        lastPcScrollDraw = millis();
+                    }
                     startY = p.y;
                     isSwiping = true;
                 }
@@ -1543,34 +1668,35 @@ void loop() {
                         saveTimerMemory();
                     }
                     drawDisplay();
+                } else if (currentPage == 6 && abs(finalDx) < 200 && abs(finalDy) < 200) {
+                    int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
+                    int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                    handlePcStatusTap(screenX, screenY);
                 } else if (currentPage == 3 && abs(finalDx) < 200 && abs(finalDy) < 200) {
                     int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
                     int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
-                    if (newsDetail && screenX < 90 && screenY < 45) {
-                        newsDetail = false; newsDetailIndex = -1; newsDetailScrollOffset = 0; drawDisplay();
-                    } else if (!newsDetail && screenY >= 30) {
-                        int index = (screenY - 52 - newsScrollOffset) / 30;
-                        if (index >= 0 && index < newsCount) { newsDetail = true; newsDetailIndex = index; newsDetailScrollOffset = 0; drawDisplay(); }
-                    }
+                    handlePcControlTap(screenX, screenY);
                 } else if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
                     // 音乐控制点击已处理
                 } else if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
                     currentPage = (currentPage - 1 + MAX_PAGES) % MAX_PAGES;
+                    pcFpsFullscreen = false;
                     scrollOffset = 0;
                     weatherScrollOffset = 0;
-                    newsScrollOffset = 0;
                     pcScrollOffset = 0;
                     lastTimeStr = ""; // 重置时间显示状态
                     drawDisplay();
                 } else if (finalDx < -SWIPE_MIN_X) { // 向左划：下一页
                     currentPage = (currentPage + 1) % MAX_PAGES;
+                    pcFpsFullscreen = false;
                     scrollOffset = 0;
                     weatherScrollOffset = 0;
-                    newsScrollOffset = 0;
                     pcScrollOffset = 0;
                     lastTimeStr = ""; // 重置时间显示状态
                     drawDisplay();
                 }
+            } else if (currentPage == 6) {
+                drawDisplay();
             }
             
             // 重置触摸状态
