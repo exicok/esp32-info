@@ -1,0 +1,181 @@
+name: Package WANMUSIC
+
+run-name: WANMUSIC ${{ github.ref_name }} packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - 'music/**'
+      - '.github/workflows/package.yml'
+  pull_request:
+    paths:
+      - 'music/**'
+      - '.github/workflows/package.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wanmusic-package-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  QT_VERSION: '6.8.3'
+  APP_VERSION: '1.0.0'
+
+jobs:
+  windows-exe:
+    name: Windows x64 EXE
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve package version
+        shell: pwsh
+        run: |
+          $version = '${{ env.APP_VERSION }}'
+          if ('${{ github.ref }}'.StartsWith('refs/tags/v')) {
+            $version = '${{ github.ref_name }}'.Substring(1)
+          }
+          if ($version -notmatch '^[0-9]+(\.[0-9]+){2}([.+~-][0-9A-Za-z.+~-]+)?$') {
+            throw "Invalid package version: $version"
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_mingw
+          modules: qtmultimedia qtsvg
+          tools: tools_mingw1310
+          cache: true
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S music -B music/build/ci-windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++.exe
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build music/build/ci-windows --parallel
+
+      - name: Deploy Qt runtime
+        shell: pwsh
+        run: |
+          $package = Join-Path $PWD "music/dist/WANMUSIC-$env:APP_VERSION-windows-x64"
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item 'music/build/ci-windows/bin/WANMUSIC.exe' $package
+          windeployqt --release --compiler-runtime --no-translations --dir $package (Join-Path $package 'WANMUSIC.exe')
+          Compress-Archive -Path "$package/*" -DestinationPath "music/dist/WANMUSIC-$env:APP_VERSION-windows-x64-portable.zip" -Force
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler not found: $iscc"
+          }
+          $source = Join-Path $PWD "music/dist/WANMUSIC-$env:APP_VERSION-windows-x64"
+          $output = Join-Path $PWD 'music/dist'
+          & $iscc "/DMyAppVersion=$env:APP_VERSION" "/DSourceDir=$source" "/DOutputDir=$output" 'music/packaging/windows/WANMUSIC.iss'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: WANMUSIC-windows-x64-${{ env.APP_VERSION }}
+          path: |
+            music/dist/WANMUSIC-${{ env.APP_VERSION }}-windows-x64-portable.zip
+            music/dist/WANMUSIC-${{ env.APP_VERSION }}-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-deb:
+    name: Linux DEB ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve package version
+        shell: bash
+        run: |
+          version='${{ env.APP_VERSION }}'
+          if [[ '${{ github.ref }}' == refs/tags/v* ]]; then
+            version='${{ github.ref_name }}'
+            version="${version#v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){2}([.+~-][0-9A-Za-z.+~-]+)?$ ]]; then
+            echo "Invalid package version: $version" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build dpkg-dev binutils desktop-file-utils libgl1-mesa-dev \
+            qt6-base-dev qt6-base-dev-tools qt6-multimedia-dev qt6-svg-dev
+
+      - name: Build and package DEB
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ env.APP_VERSION }}
+          BUILD_DIR: ${{ github.workspace }}/music/build/ci-linux-${{ matrix.arch }}
+          DIST_DIR: ${{ github.workspace }}/music/dist
+        run: sh music/package-deb.sh
+
+      - name: Inspect package
+        run: |
+          dpkg-deb --info "music/dist/wanmusic_${APP_VERSION}_${{ matrix.arch }}.deb"
+          dpkg-deb --contents "music/dist/wanmusic_${APP_VERSION}_${{ matrix.arch }}.deb"
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: WANMUSIC-deb-${{ matrix.arch }}
+          path: music/dist/wanmusic_${{ env.APP_VERSION }}_${{ matrix.arch }}.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  github-release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-exe, linux-deb]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: WANMUSIC-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum WANMUSIC-*.zip WANMUSIC-*.exe wanmusic_*.deb > SHA256SUMS.txt
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: WANMUSIC ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.zip
+            release-assets/*.exe
+            release-assets/*.deb
+            release-assets/SHA256SUMS.txt

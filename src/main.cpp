@@ -38,6 +38,8 @@ String currentLyric = "";
 String currentTranslation = "";
 uint16_t currentLyricColor = TFT_YELLOW;
 uint8_t currentLyricFontSize = 16;
+int lyricSungBytes = 0;              // 电脑版音乐软件发送的已唱 UTF-8 字节数
+uint16_t lyricSungColor = TFT_CYAN;  // 已唱部分的颜色
 bool musicIsPlaying = false;
 float musicProgressSeconds = 0;
 float musicDurationSeconds = 0;
@@ -46,6 +48,8 @@ unsigned long lastMusicProgressDraw = 0;
 String currentTimeStr = "00:00:00";
 String lastTimeStr = ""; // 用于局部刷新的上一次时间
 String currentDateStr = "2024-01-01";
+String lastTaskbarTimeStr = "";
+String lastTaskbarDateStr = "";
 bool lyricActive = false;
 bool screenHidden = false;
 unsigned long lastInteractionMillis = 0;
@@ -102,9 +106,6 @@ float pcCpuHistory[36] = {0};
 float pcGpuHistory[36] = {0};
 float pcFpsHistory[36] = {0};
 float pcGpuHistories[4][36] = {{0}};
-float pcCpuCoreUsages[32] = {0};
-int pcCpuCoreCount = 0;
-int pcCpuCoreRendered[32] = {-1};
 bool pcFpsFullscreen = false;
 float pcGpuUsage = 0;
 float pcGpuPowerWatts = -1;
@@ -115,10 +116,35 @@ unsigned long pcSyncLatencyMs = 0;
 String pcRenderedValues[10];
 String pcSummaryRenderedValues[8];
 String pcGraphicsRenderedValues[2];
-const int PC_DETAIL_OFFSET = 416;
+struct PcWindowLayoutItem { uint64_t id; int x, y, width, height, actualWidth, actualHeight; String title; };
+PcWindowLayoutItem pcWindows[8];
+int pcWindowCount = 0;
+bool pcWindowLayoutDirty = false;
+bool pcMouseDirty = false;
+int pcMouseX = -1, pcMouseY = -1;
+int pcPreviousMouseX = -1, pcPreviousMouseY = -1;
+const int PC_DETAIL_OFFSET = 212;
+const int AUDIO_SPECTRUM_BANDS = 24;
+uint8_t pcAudioSpectrum[AUDIO_SPECTRUM_BANDS] = {0};
+bool audioSpectrumDirty = false;
+bool pcAudioActive = false;
+unsigned long lastPcAudioPacket = 0;
+unsigned long lastAudioSpectrumDraw = 0;
 
 int currentPage = 0;
-#define MAX_PAGES 8
+#define PAGE_MUSIC_TIME 0
+#define PAGE_INFO 1
+#define PAGE_WEATHER 2
+#define PAGE_PC_CONTROL 3
+#define PAGE_CALENDAR 4
+#define PAGE_TIMER 5
+#define PAGE_PC_STATUS 6
+#define PAGE_WORLD_TIME 7
+#define PAGE_PC_LAYOUT 8
+#define PAGE_SETTINGS 9
+#define MAX_PAGES 10
+
+// 电脑端仅在 RTSS 进程内存大于 4GB 时上报 FPS，避免误判普通桌面程序为游戏。
 
 struct WorldClockRow {
     const char* name;
@@ -175,6 +201,9 @@ unsigned long lastTimerMemorySave = 0;
 String lastTimerValueStr = "";
 uint16_t lastTimerBackground = 0xFFFF;
 Preferences timerPreferences;
+Preferences uiPreferences;
+bool lightMode = false;
+bool retroClock = false;
 String pendingPcControlAction = "";
 unsigned long pendingPcControlUntil = 0;
 
@@ -224,6 +253,13 @@ int getUtf8CharLen(unsigned char firstByte) {
     return 1;
 }
 
+float estimatedMusicProgressSeconds() {
+    float progress = musicProgressSeconds;
+    if (musicIsPlaying) progress += (millis() - musicProgressUpdatedAt) / 1000.0f;
+    if (musicDurationSeconds > 0) progress = constrain(progress, 0.0f, musicDurationSeconds);
+    return max(0.0f, progress);
+}
+
 int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int lineHeight) {
     int lineCount = 0;
     String currentLine = "";
@@ -246,6 +282,55 @@ int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int 
         u8f.setCursor(centerX - u8f.getUTF8Width(currentLine.c_str()) / 2, startY + lineCount * lineHeight);
         u8f.print(currentLine);
         lineCount++;
+    }
+    return lineCount;
+}
+
+// 逐字歌词：sungBytes 之前的字符用 sungColor，其余用 waitingColor。
+// 换行规则与 drawWrappedTextCentered 一致，返回绘制的行数。
+int drawWrappedLyricCentered(const String& text, int sungBytes, int centerX, int startY,
+                             int maxW, int lineHeight, uint16_t waitingColor, uint16_t sungColor) {
+    int lineCount = 0;
+    int lineStart = 0;       // 当前行在 text 中的起始字节
+    int i = 0;
+    String currentLine = "";
+    while (i <= (int)text.length()) {
+        bool flush = (i == (int)text.length());
+        String ch;
+        if (!flush) {
+            int charLen = getUtf8CharLen(text[i]);
+            ch = text.substring(i, i + charLen);
+            if (u8f.getUTF8Width((currentLine + ch).c_str()) > maxW && currentLine.length() > 0) {
+                flush = true;    // 本行放不下，先输出再把该字符放到下一行
+            } else {
+                currentLine += ch;
+                i += charLen;
+                continue;
+            }
+        }
+        if (currentLine.length() > 0) {
+            int x = centerX - u8f.getUTF8Width(currentLine.c_str()) / 2;
+            int y = startY + lineCount * lineHeight;
+            int sungInLine = sungBytes - lineStart;
+            if (sungInLine < 0) sungInLine = 0;
+            if (sungInLine > (int)currentLine.length()) sungInLine = (int)currentLine.length();
+            if (sungInLine > 0) {
+                String sung = currentLine.substring(0, sungInLine);
+                u8f.setForegroundColor(sungColor);
+                u8f.setCursor(x, y);
+                u8f.print(sung);
+                x += u8f.getUTF8Width(sung.c_str());
+            }
+            if (sungInLine < (int)currentLine.length()) {
+                u8f.setForegroundColor(waitingColor);
+                u8f.setCursor(x, y);
+                u8f.print(currentLine.substring(sungInLine));
+            }
+            lineCount++;
+            lineStart += currentLine.length();
+            currentLine = "";
+        }
+        if (i == (int)text.length()) break;
     }
     return lineCount;
 }
@@ -347,6 +432,9 @@ void drawInfoContent(bool forceRefresh) {
 void drawWeatherPage();
 void drawPcStatusPage();
 void drawFpsFullscreen();
+void drawPcLayoutPage();
+void drawSettingsPage();
+void drawDisplay();
 
 String windDirectionDesc(float degrees) {
     static const char* directions[] = {"北", "东北", "东", "东南", "南", "西南", "西", "西北"};
@@ -381,13 +469,13 @@ void drawWindAnimation() {
 
 void drawWeatherPage() {
     tft.fillScreen(TFT_BLACK);
-    // 天气页不显示任务栏
-
     u8f.setFontMode(1);
     u8f.setBackgroundColor(TFT_BLACK);
     u8f.setFont(u8g2_font_wqy12_t_gb2312);
 
     if (!currentWeather.isValid) {
+        tft.fillRoundRect(10, 32, 300, 82, 8, tft.color565(24, 28, 34));
+        tft.drawRoundRect(10, 32, 300, 82, 8, TFT_YELLOW);
         u8f.setForegroundColor(TFT_YELLOW);
         u8f.setCursor(20, 60);
         u8f.print("等待电脑版天气数据");
@@ -397,107 +485,58 @@ void drawWeatherPage() {
         return;
     }
 
-    int y = 15 + weatherScrollOffset; // 无任务栏，起始位置更靠上
-
-    // 城市名称（居中显示）
-    if (y > 0 && y < SCREEN_HEIGHT) {
-        u8f.setForegroundColor(TFT_CYAN);
-        u8f.setFont(u8g2_font_wqy12_t_gb2312);
-        int cityWidth = u8f.getUTF8Width(currentWeather.city.c_str());
-        u8f.setCursor((SCREEN_WIDTH - cityWidth) / 2, y);
-        u8f.print(currentWeather.city);
-    }
-    y += 35;
-
-    // 当前温度（大号字体，居中）- 只显示数字部分
-    if (y > 24 && y < SCREEN_HEIGHT) {
-        u8f.setForegroundColor(TFT_WHITE);
-        u8f.setFont(u8g2_font_logisoso32_tn);
-        // 提取温度数字部分（去掉°C）
-        String tempNum = currentWeather.temp;
-        int degreeIdx = tempNum.indexOf("°");
-        if (degreeIdx > 0) tempNum = tempNum.substring(0, degreeIdx);
-        int tempWidth = u8f.getUTF8Width(tempNum.c_str());
-        // 温度数字居中
-        int tempX = (SCREEN_WIDTH - tempWidth) / 2;
-        u8f.setCursor(tempX, y);
-        u8f.print(tempNum);
-        // 在温度后显示单位（用普通字体）
-        u8f.setFont(u8g2_font_wqy12_t_gb2312);
-        u8f.setCursor(tempX + tempWidth + 5, y + 12);
-        u8f.print("°C");
-    }
-    y += 50;
-
-    // 天气状况（居中）
-    if (y > 24 && y < SCREEN_HEIGHT) {
-        u8f.setForegroundColor(TFT_YELLOW);
-        u8f.setFont(u8g2_font_wqy12_t_gb2312);
-        int weatherWidth = u8f.getUTF8Width(currentWeather.weather.c_str());
-        u8f.setCursor((SCREEN_WIDTH - weatherWidth) / 2, y);
-        u8f.print(currentWeather.weather);
-    }
-    y += 25;
-
-    // 详细信息（两列布局）
-    if (y > 24 && y < SCREEN_HEIGHT) {
-        u8f.setForegroundColor(TFT_LIGHTGREY);
-        u8f.setCursor(30, y);
-        u8f.print("湿度: " + currentWeather.humidity);
-        u8f.setCursor(180, y);
-        u8f.print("风向: " + currentWeather.windDir);
-    }
-    drawWindAnimation();
-    y += 18;
-    if (y > 24 && y < SCREEN_HEIGHT) {
-        u8f.setCursor(30, y);
-        u8f.print("风速: " + currentWeather.windSpeed);
-    }
-    y += 25;
-
-    // 分隔线
-    if (y > 24 && y < SCREEN_HEIGHT) {
-        tft.drawFastHLine(20, y, SCREEN_WIDTH - 40, tft.color565(60, 60, 60));
-    }
-    y += 12;
-
-    // 未来7天预报标题
-    if (y > 24 && y < SCREEN_HEIGHT) {
-        u8f.setForegroundColor(TFT_YELLOW);
-        u8f.setCursor(20, y);
-        u8f.print("未来7天预报");
-    }
-    y += 22;
-
-    // 7天预报（详细布局，每行显示更多信息）
+    int y = 12 + weatherScrollOffset;
+    tft.fillRoundRect(8, y, 304, 112, 10, tft.color565(20, 26, 34));
+    tft.drawRoundRect(8, y, 304, 112, 10, TFT_CYAN);
+    u8f.setForegroundColor(TFT_CYAN);
+    u8f.setCursor(22, y + 24);
+    u8f.print(currentWeather.city);
+    String tempNum = currentWeather.temp;
+    int degreeIdx = tempNum.indexOf("°");
+    if (degreeIdx > 0) tempNum = tempNum.substring(0, degreeIdx);
+    u8f.setForegroundColor(TFT_WHITE);
+    u8f.setFont(u8g2_font_logisoso32_tn);
+    u8f.setCursor(22, y + 74);
+    u8f.print(tempNum);
     u8f.setFont(u8g2_font_wqy12_t_gb2312);
-    for (int i = 0; i < 7; i++) {
+    u8f.setCursor(102, y + 58);
+    u8f.print("°C");
+    u8f.setForegroundColor(TFT_YELLOW);
+    u8f.setCursor(178, y + 48);
+    u8f.print(currentWeather.weather);
+    u8f.setForegroundColor(TFT_LIGHTGREY);
+    u8f.setCursor(178, y + 72);
+    u8f.print("湿度 " + currentWeather.humidity);
+    u8f.setCursor(178, y + 94);
+    u8f.print(currentWeather.windDir + " " + currentWeather.windSpeed);
+    drawWindAnimation();
+
+    y += 130;
+    tft.fillRoundRect(8, y, 304, 96, 8, tft.color565(18, 22, 28));
+    tft.drawRoundRect(8, y, 304, 96, 8, tft.color565(60, 70, 86));
+    u8f.setForegroundColor(TFT_YELLOW);
+    u8f.setCursor(20, y + 22);
+    u8f.print("未来预报");
+    y += 44;
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    for (int i = 0; i < 4; i++) {
         if (y > SCREEN_HEIGHT + 20) break;
-
         String dateStr = forecast[i].date.substring(5); // 只显示月-日
-
-        // 日期（青色）
         if (y > 24 && y < SCREEN_HEIGHT) {
             u8f.setForegroundColor(TFT_CYAN);
             u8f.setCursor(20, y);
             u8f.print(dateStr);
-
-            // 天气（白色）
             u8f.setForegroundColor(TFT_WHITE);
             u8f.setCursor(75, y);
             u8f.print(forecast[i].weather);
-
-            // 最高温（红色）
             u8f.setForegroundColor(TFT_RED);
             u8f.setCursor(150, y);
             u8f.print(forecast[i].high);
-
-            // 最低温（蓝色）
             u8f.setForegroundColor(TFT_BLUE);
             u8f.setCursor(210, y);
             u8f.print(forecast[i].low);
         }
-        y += 22;
+        y += 18;
     }
 
     // 绘制滚动条指示器
@@ -523,12 +562,24 @@ void drawMusicControls() {
 
 void drawMusicProgress() {
     if (!lyricActive || musicDurationSeconds <= 0) return;
-    float progress = musicProgressSeconds;
-    if (musicIsPlaying) progress += (millis() - musicProgressUpdatedAt) / 1000.0f;
-    progress = constrain(progress / musicDurationSeconds, 0.0f, 1.0f);
+    float progress = constrain(estimatedMusicProgressSeconds() / musicDurationSeconds, 0.0f, 1.0f);
     const int x = 20, y = 178, width = 280, height = 4;
     tft.fillRect(x, y, width, height, tft.color565(55, 60, 68));
     tft.fillRect(x, y, static_cast<int>(width * progress), height, TFT_CYAN);
+}
+
+void drawAudioSpectrumBackground() {
+    const int gap = 2;
+    const int top = 156;
+    const int maxHeight = SCREEN_HEIGHT - top;
+    const int barWidth = (SCREEN_WIDTH - gap * (AUDIO_SPECTRUM_BANDS + 1)) / AUDIO_SPECTRUM_BANDS;
+    for (int i = 0; i < AUDIO_SPECTRUM_BANDS; ++i) {
+        int height = map(pcAudioSpectrum[i], 0, 255, 1, maxHeight);
+        int x = gap + i * (barWidth + gap);
+        tft.fillRect(x, SCREEN_HEIGHT - height, barWidth, height,
+                     tft.color565(8, 22 + i * 30 / AUDIO_SPECTRUM_BANDS,
+                                  34 + i * 42 / AUDIO_SPECTRUM_BANDS));
+    }
 }
 
 bool sendMusicControl(const char* action) {
@@ -541,7 +592,7 @@ bool sendMusicControl(const char* action) {
 }
 
 bool handleMusicControlTap(int rawX, int rawY) {
-    if (!lyricActive || currentPage != 0) return false;
+    if (!lyricActive || currentPage != PAGE_MUSIC_TIME) return false;
     int screenX = constrain(map(rawX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
     int screenY = constrain(map(rawY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
     if (screenY < 188 || screenY > 239) return false;
@@ -562,8 +613,10 @@ bool sendPcControl(const char* action) {
 }
 
 void drawPcControlPage() {
-    const char* labels[] = {"播放/暂停", "最小化", "最大化", "关闭窗口", "重启电脑", "关闭电脑"};
-    const uint16_t colors[] = {TFT_CYAN, TFT_GREEN, TFT_GREEN, TFT_YELLOW, TFT_ORANGE, TFT_RED};
+    const char* labels[] = {"播放/暂停", "最小化", "最大化", "关闭窗口", "注册登录", "注销登录",
+                            "资源管理器", "Alt+Tab", "Win+Tab", "重启电脑", "关闭电脑"};
+    const uint16_t colors[] = {TFT_CYAN, TFT_GREEN, TFT_GREEN, TFT_YELLOW, TFT_ORANGE, TFT_ORANGE,
+                               TFT_CYAN, TFT_CYAN, TFT_CYAN, TFT_ORANGE, TFT_RED};
     tft.fillScreen(TFT_BLACK);
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
     u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
@@ -575,26 +628,30 @@ void drawPcControlPage() {
         pendingPcControlAction = "";
         u8f.setCursor(88, 24); u8f.print("窗口操作作用于鼠标所在窗口");
     }
-    for (int i = 0; i < 6; ++i) {
-        int x = 8 + (i % 2) * 156;
-        int y = 38 + (i / 2) * 64;
-        tft.drawRoundRect(x, y, 148, 54, 5, colors[i]);
+    const int columns = 3, cardWidth = 100, cardHeight = 38, cardGapX = 6, cardGapY = 7;
+    for (int i = 0; i < 11; ++i) {
+        int x = 8 + (i % columns) * (cardWidth + cardGapX);
+        int y = 38 + (i / columns) * (cardHeight + cardGapY);
+        tft.drawRoundRect(x, y, cardWidth, cardHeight, 5, colors[i]);
         u8f.setForegroundColor(colors[i]);
         int textWidth = u8f.getUTF8Width(labels[i]);
-        u8f.setCursor(x + (148 - textWidth) / 2, y + 33); u8f.print(labels[i]);
+        u8f.setCursor(x + (cardWidth - textWidth) / 2, y + 25); u8f.print(labels[i]);
     }
 }
 
 bool handlePcControlTap(int screenX, int screenY) {
-    const char* actions[] = {"media-play-pause", "minimize", "maximize", "close", "restart", "shutdown"};
-    if (screenY < 38 || screenY > 220) return false;
-    int column = screenX < 160 ? 0 : 1;
-    int row = (screenY - 38) / 64;
-    if (row < 0 || row > 2) return false;
-    if ((screenY - 38) % 64 >= 54) return false;
-    int index = row * 2 + column;
+    const char* actions[] = {"media-play-pause", "minimize", "maximize", "close", "register", "unregister",
+                             "explorer", "alt-tab", "win-tab", "restart", "shutdown"};
+    const int columns = 3, cardWidth = 100, cardHeight = 38, cardGapX = 6, cardGapY = 7;
+    if (screenX < 8 || screenX >= 8 + columns * cardWidth + (columns - 1) * cardGapX || screenY < 38) return false;
+    int column = (screenX - 8) / (cardWidth + cardGapX);
+    if ((screenX - 8) % (cardWidth + cardGapX) >= cardWidth) return false;
+    int row = (screenY - 38) / (cardHeight + cardGapY);
+    if ((screenY - 38) % (cardHeight + cardGapY) >= cardHeight) return false;
+    int index = row * columns + column;
+    if (index >= 11) return false;
     String action = actions[index];
-    if (index >= 4) {
+    if (index >= 9) {
         if (pendingPcControlAction == action && millis() < pendingPcControlUntil) {
             sendPcControl(actions[index]);
             pendingPcControlAction = "";
@@ -855,31 +912,6 @@ bool pcRegionVisible(int top, int height) {
     return top < SCREEN_HEIGHT && top + height > 0;
 }
 
-void drawCpuCorePanel(int o, bool force) {
-    const int top = 212 + o;
-    if (force) {
-        tft.drawRoundRect(4, top, 312, 198, 6, tft.color565(55, 65, 78));
-        u8f.setFont(u8g2_font_wqy12_t_gb2312);
-        u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, top + 20); u8f.print("逻辑处理器核心占用");
-        for (int i = 0; i < 32; ++i) pcCpuCoreRendered[i] = -1;
-    }
-    int count = min(pcCpuCoreCount, 32);
-    for (int i = 0; i < count; ++i) {
-        int value = constrain(static_cast<int>(pcCpuCoreUsages[i] + 0.5f), 0, 100);
-        if (!force && value == pcCpuCoreRendered[i]) continue;
-        int column = i % 4, row = i / 4;
-        int x = 9 + column * 77, y = top + 28 + row * 20;
-        tft.fillRect(x, y, 73, 18, TFT_BLACK);
-        u8f.setForegroundColor(value >= 85 ? TFT_RED : (value >= 60 ? TFT_YELLOW : TFT_GREEN));
-        u8f.setCursor(x + 2, y + 13); u8f.print(String(i) + " " + String(value) + "%");
-        int barWidth = 20 * value / 100;
-        tft.drawRect(x + 50, y + 4, 22, 8, tft.color565(55, 65, 78));
-        if (barWidth > 0) tft.fillRect(x + 51, y + 5, barWidth, 6,
-            value >= 85 ? TFT_RED : (value >= 60 ? TFT_YELLOW : TFT_GREEN));
-        pcCpuCoreRendered[i] = value;
-    }
-}
-
 void refreshFpsFullscreen() {
     String fpsText = pcFps >= 0 ? String(pcFps, 0) : String("--");
     if (pcGraphSpriteReady) {
@@ -1035,7 +1067,6 @@ void refreshPcStatusPage() {
 
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
     if (pcRegionVisible(o, 206)) refreshPcSummaryCards(o);
-    if (pcRegionVisible(212 + o, 198)) drawCpuCorePanel(o, false);
     for (int i = 0; i < 10; ++i) {
         if (!pcRegionVisible(y[i] - 18 + o, 22)) continue;
         if (values[i] == pcRenderedValues[i]) continue;
@@ -1102,7 +1133,6 @@ void drawPcStatusPage() {
     int d = PC_DETAIL_OFFSET;
 
     drawPcSummaryCards(o);
-    drawCpuCorePanel(o, true);
 
     tft.drawRoundRect(4, 5 + d + o, 312, 110, 6, tft.color565(55, 65, 78));
     u8f.setForegroundColor(TFT_CYAN); u8f.setCursor(12, 24 + d + o); u8f.print("处理器");
@@ -1156,24 +1186,92 @@ void drawPcStatusPage() {
     lastPcStatusDraw = millis();
 }
 
+// 电脑窗口布局页：用方框将实时电脑数据分区显示。
+void drawPcLayoutPage() {
+    tft.fillScreen(TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK); u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    const uint16_t colors[] = {TFT_CYAN, TFT_YELLOW, TFT_GREEN, TFT_MAGENTA,
+                               TFT_ORANGE, TFT_WHITE, TFT_LIGHTGREY, TFT_BLUE};
+    for (int i = pcWindowCount - 1; i >= 0; --i) {
+        const PcWindowLayoutItem& item = pcWindows[i];
+        if (item.width < 4 || item.height < 4) continue;
+        uint16_t color = colors[i % 8];
+        tft.drawRect(item.x, item.y, item.width, item.height, color);
+        if (item.height >= 18 && item.width >= 24 && item.title.length()) {
+            int titleOffset = 0;
+            for (int j = i + 1; j < pcWindowCount; ++j)
+                if (abs(pcWindows[j].x - item.x) < 12 && abs(pcWindows[j].y - item.y) < 12)
+                    titleOffset += 10;
+            u8f.setForegroundColor(color); u8f.setCursor(item.x + 3, item.y + 13 + titleOffset);
+            String label = item.title + " " + String(item.actualWidth) + "x" + String(item.actualHeight);
+            u8f.print(label.substring(0, max(1, (item.width - 6) / 12)));
+        }
+    }
+}
+
+void drawSettingsPage() {
+    tft.fillScreen(lightMode ? TFT_WHITE : TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(lightMode ? TFT_WHITE : TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(lightMode ? TFT_BLACK : TFT_CYAN);
+    u8f.setCursor(12, 30); u8f.print("设置");
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    u8f.setForegroundColor(lightMode ? TFT_BLACK : TFT_WHITE);
+    u8f.setCursor(18, 76); u8f.print(String("显示模式: ") + (lightMode ? "亮色模式" : "深色模式"));
+    u8f.setCursor(18, 126); u8f.print(String("时间样式: ") + (retroClock ? "复古风格" : "标准风格"));
+    u8f.setForegroundColor(lightMode ? TFT_BLUE : TFT_YELLOW);
+    u8f.setCursor(18, 190); u8f.print("点击上方选项切换");
+}
+
+void refreshPcLayoutMouse() {
+    int minX = SCREEN_WIDTH, minY = SCREEN_HEIGHT, maxX = 0, maxY = 0;
+    if (pcPreviousMouseX >= 0) { minX = min(minX, pcPreviousMouseX - 8); minY = min(minY, pcPreviousMouseY - 8); maxX = max(maxX, pcPreviousMouseX + 8); maxY = max(maxY, pcPreviousMouseY + 8); }
+    if (pcMouseX >= 0) { minX = min(minX, pcMouseX - 8); minY = min(minY, pcMouseY - 8); maxX = max(maxX, pcMouseX + 8); maxY = max(maxY, pcMouseY + 8); }
+    if (minX >= SCREEN_WIDTH) return;
+    minX = constrain(minX, 0, SCREEN_WIDTH - 1); minY = constrain(minY, 0, SCREEN_HEIGHT - 1);
+    maxX = constrain(maxX, 0, SCREEN_WIDTH - 1); maxY = constrain(maxY, 0, SCREEN_HEIGHT - 1);
+    const uint16_t colors[] = {TFT_CYAN, TFT_YELLOW, TFT_GREEN, TFT_MAGENTA,
+                               TFT_ORANGE, TFT_WHITE, TFT_LIGHTGREY, TFT_BLUE};
+    for (int i = pcWindowCount - 1; i >= 0; --i) {
+        const PcWindowLayoutItem& w = pcWindows[i];
+        int right = w.x + w.width - 1, bottom = w.y + w.height - 1;
+        if (right >= minX && w.x <= maxX && bottom >= minY && w.y <= maxY) {
+            uint16_t color = colors[i % 8];
+            tft.drawRect(w.x, w.y, w.width, w.height, color);
+            if (w.height >= 18 && w.width >= 24 && w.title.length()) {
+                u8f.setForegroundColor(color); u8f.setCursor(w.x + 3, w.y + 13);
+                String label = w.title + " " + String(w.actualWidth) + "x" + String(w.actualHeight);
+                u8f.print(label.substring(0, max(1, (w.width - 6) / 12)));
+            }
+        }
+    }
+    pcPreviousMouseX = pcMouseX; pcPreviousMouseY = pcMouseY;
+}
+
+// 只重绘歌词区域（不动进度条与控制按钮），用于逐字高亮推进时避免整屏闪烁。
+void drawLyricArea() {
+    tft.fillRect(0, 40, SCREEN_WIDTH, 134, TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    switch (currentLyricFontSize) {
+        case 12: u8f.setFont(u8g2_font_wqy12_t_gb2312); break;
+        case 13: u8f.setFont(u8g2_font_wqy13_t_gb2312); break;
+        case 14: u8f.setFont(u8g2_font_wqy14_t_gb2312); break;
+        case 15: u8f.setFont(u8g2_font_wqy15_t_gb2312); break;
+        default: u8f.setFont(u8g2_font_wqy16_t_gb2312); break;
+    }
+    int lyricLines = drawWrappedLyricCentered(currentLyric, lyricSungBytes, 160, 70,
+                                              SCREEN_WIDTH - 20, 20,
+                                              currentLyricColor, lyricSungColor);
+    if (currentTranslation.length() > 0) {
+        u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
+        drawWrappedTextCentered(currentTranslation, 160, 70 + lyricLines * 20 + 8, SCREEN_WIDTH - 20, 18);
+    }
+}
+
 void drawDisplay() {
-    if (currentPage == 0) {
+    if (currentPage == PAGE_MUSIC_TIME) {
         if (lyricActive && currentLyric.length() > 0) {
             tft.fillScreen(TFT_BLACK);
-            u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
-            switch (currentLyricFontSize) {
-                case 12: u8f.setFont(u8g2_font_wqy12_t_gb2312); break;
-                case 13: u8f.setFont(u8g2_font_wqy13_t_gb2312); break;
-                case 14: u8f.setFont(u8g2_font_wqy14_t_gb2312); break;
-                case 15: u8f.setFont(u8g2_font_wqy15_t_gb2312); break;
-                default: u8f.setFont(u8g2_font_wqy16_t_gb2312); break;
-            }
-            u8f.setForegroundColor(currentLyricColor);
-            int lyricLines = drawWrappedTextCentered(currentLyric, 160, 70, SCREEN_WIDTH - 20, 20);
-            if (currentTranslation.length() > 0) {
-                u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
-                drawWrappedTextCentered(currentTranslation, 160, 70 + lyricLines * 20 + 8, SCREEN_WIDTH - 20, 18);
-            }
+            drawLyricArea();
             drawMusicProgress();
             drawMusicControls();
             lastTimeStr = ""; // 重置，下次显示时间时全量绘制
@@ -1188,11 +1286,22 @@ void drawDisplay() {
             int totalWidth = charWidth * 8; // "HH:MM:SS" 共8个字符
             int startX = (SCREEN_WIDTH - totalWidth) / 2;
             int y = 120;
+            tft.setTextSize(1);
+            tft.setTextDatum(TC_DATUM);
+            tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+            tft.drawString(currentDateStr, SCREEN_WIDTH / 2, 164);
+            tft.setTextSize(retroClock ? 6 : 5);
+            tft.setTextDatum(CC_DATUM);
             
             if (lastTimeStr.length() != currentTimeStr.length()) {
                 tft.fillScreen(TFT_BLACK);
-                tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextColor(lightMode ? TFT_BLACK : (retroClock ? TFT_ORANGE : TFT_WHITE),
+                             lightMode ? TFT_WHITE : TFT_BLACK);
                 tft.drawString(currentTimeStr, 160, y);
+                tft.setTextSize(1); tft.setTextDatum(TC_DATUM);
+                tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                tft.drawString(currentDateStr, SCREEN_WIDTH / 2, 164);
+                tft.setTextSize(5); tft.setTextDatum(CC_DATUM);
             } else {
                 tft.setTextColor(TFT_WHITE, TFT_BLACK);
                 // 逐字符比较，只重绘变化的字符
@@ -1210,40 +1319,55 @@ void drawDisplay() {
             }
             lastTimeStr = currentTimeStr;
         }
-    } else if (currentPage == 1) {
+    } else if (currentPage == PAGE_INFO) {
         tft.fillScreen(TFT_BLACK);
         drawInfoContent(true);
         drawTaskbar();
-    } else if (currentPage == 2) {
+    } else if (currentPage == PAGE_WEATHER) {
         drawWeatherPage();
-    } else if (currentPage == 3) {
+    } else if (currentPage == PAGE_PC_CONTROL) {
         drawPcControlPage();
-    } else if (currentPage == 4) {
+    } else if (currentPage == PAGE_CALENDAR) {
         drawCalendarPage();
-    } else if (currentPage == 5) {
+    } else if (currentPage == PAGE_TIMER) {
         drawTimerPage();
-    } else if (currentPage == 6) {
+    } else if (currentPage == PAGE_PC_STATUS) {
         drawPcStatusPage();
-    } else if (currentPage == 7) {
+    } else if (currentPage == PAGE_PC_LAYOUT) {
+        drawPcLayoutPage();
+    } else if (currentPage == PAGE_SETTINGS) {
+        drawSettingsPage();
+    } else if (currentPage == PAGE_WORLD_TIME) {
         drawWorldTimePage();
     }
 }
 
+// 电脑端歌词包，字段以 '|' 分隔（至少 8 个分隔符）：
+//   0 歌词颜色 #rrggbb   1 字号 12..16      2 已播放秒数   3 总秒数
+//   4 是否播放 0/1       5 已唱 UTF-8 字节  6 已唱颜色     7 预留
+//   分隔符 7 之后为正文：第一行原文，'\n' 之后为翻译（可省略）
 void applyDesktopLyricPacket(const String& data) {
     if (data.length() == 0 || data.length() > 1800) return;
     int seps[8]; int lastSep = -1; int sc = 0;
     for(int i=0; i<8; i++) { int p = data.indexOf('|', lastSep+1); if(p == -1) break; seps[sc++] = p; lastSep = p; }
     if (sc >= 8) {
+        String previousLyric = currentLyric;
+        String previousTranslation = currentTranslation;
         currentLyricColor = hexTo565(data.substring(0, seps[0]));
         currentLyricFontSize = constrain(data.substring(seps[0] + 1, seps[1]).toInt(), 12, 16);
         musicProgressSeconds = data.substring(seps[1] + 1, seps[2]).toFloat();
         musicDurationSeconds = data.substring(seps[2] + 1, seps[3]).toFloat();
         musicIsPlaying = data.substring(seps[3] + 1, seps[4]).toInt() == 1;
+        int sungBytes = data.substring(seps[4] + 1, seps[5]).toInt();
+        String sungColor = data.substring(seps[5] + 1, seps[6]);
+        lyricSungColor = sungColor.length() ? hexTo565(sungColor) : TFT_CYAN;
         musicProgressUpdatedAt = millis();
         String fullText = data.substring(seps[7] + 1);
         int nIdx = fullText.indexOf('\n');
         if (nIdx != -1) { currentLyric = fullText.substring(0, nIdx); currentTranslation = fullText.substring(nIdx+1); }
         else { currentLyric = fullText; currentTranslation = ""; }
+        lyricSungBytes = constrain(sungBytes, 0, (int)currentLyric.length());
+        bool wasActive = lyricActive;
         lyricActive = (currentLyric.length() > 0);
         lastLyricTime = millis();
         lastInteractionMillis = millis();
@@ -1251,7 +1375,17 @@ void applyDesktopLyricPacket(const String& data) {
             screenHidden = false;
             digitalWrite(TFT_BL, HIGH);
         }
-        if (currentPage == 0) drawDisplay();
+        if (currentPage == PAGE_MUSIC_TIME) {
+            // 同一句歌词只推进高亮时局部重绘，避免整屏闪烁。
+            if (wasActive && lyricActive && previousLyric == currentLyric
+                && previousTranslation == currentTranslation) {
+                drawLyricArea();
+                drawMusicProgress();
+                drawMusicControls();
+            } else {
+                drawDisplay();
+            }
+        }
     }
 }
 
@@ -1264,8 +1398,83 @@ void sendDesktopAck(const char* cmd, const char* message) {
     Serial.println();
 }
 
+String formatTimerPreview(unsigned long milliseconds) {
+    unsigned long seconds = milliseconds / 1000UL;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+             seconds / 3600UL, (seconds / 60UL) % 60UL, seconds % 60UL);
+    return String(buf);
+}
+
+String buildScreenPreviewText() {
+    if (screenHidden) return String("屏幕已关闭\n当前页面: ") + String(currentPage);
+
+    switch (currentPage) {
+        case PAGE_MUSIC_TIME:
+            if (lyricActive && currentLyric.length() > 0) {
+                String text = "音乐/歌词\n";
+                text += currentLyric;
+                if (currentTranslation.length() > 0) {
+                    text += "\n";
+                    text += currentTranslation;
+                }
+                if (musicDurationSeconds > 0) {
+                    text += String("\n进度: ") + String(estimatedMusicProgressSeconds(), 1)
+                         + " / " + String(musicDurationSeconds, 1) + " 秒";
+                }
+                text += (musicIsPlaying ? "\n状态: 播放中" : "\n状态: 已暂停");
+                return text;
+            }
+            return String("时间\n") + currentTimeStr + "\n日期: " + currentDateStr;
+        case PAGE_INFO:
+            return String("系统信息\n芯片: ") + String(ESP.getChipModel())
+                 + "\nCPU: " + String(ESP.getCpuFreqMHz()) + " MHz"
+                 + "\n堆内存: " + String(ESP.getFreeHeap() / 1024) + " KB 可用";
+        case PAGE_WEATHER:
+            if (!currentWeather.isValid) return String("天气\n城市: ") + weatherCity + "\n等待电脑版天气数据";
+            return String("天气\n城市: ") + currentWeather.city
+                 + "\n温度: " + currentWeather.temp
+                 + "\n天气: " + currentWeather.weather
+                 + "\n湿度: " + currentWeather.humidity
+                 + "\n风速: " + currentWeather.windSpeed
+                 + "\n风向: " + currentWeather.windDir;
+        case PAGE_PC_CONTROL:
+            return "电脑控制\n播放/暂停  最小化  最大化\n关闭  重启  关机";
+        case PAGE_CALENDAR:
+            return String("日历\n日期: ") + currentDateStr + "\n时间: " + currentTimeStr;
+        case PAGE_TIMER:
+            return String(timerCountdownMode ? "倒计时" : "秒表计时")
+                 + "\n时间: " + formatTimerPreview(currentTimerValue())
+                 + "\n状态: " + (timerRunning ? "运行中" : "已暂停");
+        case PAGE_PC_STATUS:
+            if (pcFpsFullscreen) return String("电脑状态 FPS 全屏\nFPS: ") + (pcFps >= 0 ? String(pcFps, 1) : String("--"));
+            return String("电脑状态\nFPS: ") + (pcFps >= 0 ? String(pcFps, 1) : String("--"))
+                 + "\nCPU: " + String(pcCpuUsage, 1) + "%"
+                 + "\n内存: " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB (" + String(pcMemoryUsage, 1) + "%)"
+                 + "\nGPU: " + String(pcGpuUsage, 1) + "%";
+        case PAGE_PC_LAYOUT:
+            return "电脑窗口布局（仅窗口方框）\n窗口数量: " + String(pcWindowCount);
+        case PAGE_SETTINGS:
+            return "设置\n显示模式: " + String(lightMode ? "亮色模式" : "深色模式")
+                 + "\n时间样式: " + String(retroClock ? "复古风格" : "标准风格");
+        case PAGE_WORLD_TIME: {
+            String text = "世界时间";
+            time_t utcNow = time(nullptr);
+            for (int i = 0; i < 6; ++i) {
+                text += "\n";
+                text += WORLD_CLOCK_ROWS[i].name;
+                text += " ";
+                text += desktopTimeSynced ? formatWorldTime(utcNow, WORLD_CLOCK_ROWS[i].utcOffsetHours) : "--:--:--";
+            }
+            return text;
+        }
+        default:
+            return "未知页面: " + String(currentPage);
+    }
+}
+
 void sendDesktopTelemetry() {
-    DynamicJsonDocument doc(1536);
+    DynamicJsonDocument doc(2304);
     doc["type"] = "telemetry";
     doc["chipModel"] = ESP.getChipModel();
     doc["chipRevision"] = ESP.getChipRevision();
@@ -1285,12 +1494,15 @@ void sendDesktopTelemetry() {
     doc["timeSource"] = activeTimeSource == TimeSource::DESKTOP ? "pc-via-com" : "unsynced";
     doc["date"] = currentDateStr;
     doc["time"] = currentTimeStr;
+    doc["currentPage"] = currentPage;
+    doc["screenHidden"] = screenHidden;
+    doc["screenPreview"] = buildScreenPreviewText();
     serializeJson(doc, Serial);
     Serial.println();
 }
 
 void handleDesktopCommand(const String& line) {
-    DynamicJsonDocument doc(8192);
+    DynamicJsonDocument doc(12288);
     DeserializationError error = deserializeJson(doc, line);
     if (error) return;
 
@@ -1320,11 +1532,12 @@ void handleDesktopCommand(const String& line) {
         sendDesktopAck(cmd, "屏幕已开启");
     } else if (strcmp(cmd, "set_page") == 0) {
         int requestedPage = constrain(doc["page"] | 0, 0, MAX_PAGES - 1);
-        if (requestedPage != 6) pcFpsFullscreen = false;
-        if (requestedPage != 0) {
+        if (requestedPage != PAGE_PC_STATUS) pcFpsFullscreen = false;
+        if (requestedPage != PAGE_MUSIC_TIME) {
             lyricActive = false;
             currentLyric = "";
             currentTranslation = "";
+            lyricSungBytes = 0;
         }
         currentPage = requestedPage;
         scrollOffset = 0;
@@ -1359,8 +1572,28 @@ void handleDesktopCommand(const String& line) {
             forecast[i].weather = wmoWeatherDesc(daily[i]["weatherCode"] | -1);
         }
         currentWeather.isValid = true;
-        if (currentPage == 2 && !screenHidden) drawWeatherPage();
+        if (currentPage == PAGE_WEATHER && !screenHidden) drawWeatherPage();
         sendDesktopAck(cmd, "电脑版天气已更新");
+    } else if (strcmp(cmd, "audio_spectrum") == 0) {
+        JsonArray levels = doc["levels"].as<JsonArray>();
+        bool audioActive = doc["active"] | false;
+        bool hasSpectrum = !levels.isNull() && levels.size() == AUDIO_SPECTRUM_BANDS;
+        pcAudioActive = audioActive;
+        lastPcAudioPacket = millis();
+        if (hasSpectrum) {
+            for (int i = 0; i < AUDIO_SPECTRUM_BANDS; ++i)
+                pcAudioSpectrum[i] = constrain(levels[i].as<int>(), 0, 255);
+            audioSpectrumDirty = true;
+        }
+        // 只要收到完整频谱数据就唤醒屏幕，不依赖发送端的 active 标志。
+        if (hasSpectrum || audioActive) {
+            lastInteractionMillis = millis();
+            if (screenHidden) {
+                screenHidden = false;
+                digitalWrite(TFT_BL, HIGH);
+                drawDisplay();
+            }
+        }
     } else if (strcmp(cmd, "pc_status") == 0) {
         bool pauseCpu = doc["pauseCpu"] | false;
         bool pauseMemory = doc["pauseMemory"] | false;
@@ -1374,14 +1607,6 @@ void handleDesktopCommand(const String& line) {
             pcCpuMaxMHz = doc["cpuMaxMHz"] | 0;
             pcCpuCurrentMHz = doc["cpuCurrentMHz"] | pcCpuMaxMHz;
             pcCpuPowerWatts = doc["cpuPowerWatts"] | -1.0f;
-            JsonArray coreUsages = doc["cpuCoreUsages"].as<JsonArray>();
-            if (!coreUsages.isNull()) {
-                pcCpuCoreCount = 0;
-                for (JsonVariant usage : coreUsages) {
-                    if (pcCpuCoreCount >= 32) break;
-                    pcCpuCoreUsages[pcCpuCoreCount++] = usage.as<float>();
-                }
-            }
         }
         if (!pauseMemory) {
             pcMemoryUsedMB = doc["memoryUsedMB"] | 0;
@@ -1421,6 +1646,48 @@ void handleDesktopCommand(const String& line) {
                 pcGpuFanRpms[pcGpuCount] = gpu["fanRpm"] | -1;
                 pcGpuPowerWattValues[pcGpuCount] = gpu["powerWatts"] | -1.0f;
                 ++pcGpuCount;
+            }
+        }
+        JsonArray windows = doc["windows"].as<JsonArray>();
+        int nextMouseX = constrain(doc["mouseX"] | -1, -1, SCREEN_WIDTH - 1);
+        int nextMouseY = constrain(doc["mouseY"] | -1, -1, SCREEN_HEIGHT - 1);
+        pcMouseX = nextMouseX;
+        pcMouseY = nextMouseY;
+        if (!windows.isNull()) {
+            PcWindowLayoutItem nextWindows[8];
+            int nextWindowCount = 0;
+            for (JsonObject window : windows) {
+                if (nextWindowCount >= 8) break;
+                PcWindowLayoutItem& item = nextWindows[nextWindowCount++];
+                item.id = window["id"] | 0ULL;
+                item.x = constrain(window["x"] | 0, 0, SCREEN_WIDTH - 1);
+                item.y = constrain(window["y"] | 0, 0, SCREEN_HEIGHT - 1);
+                item.width = constrain(window["w"] | 1, 1, SCREEN_WIDTH - item.x);
+                item.height = constrain(window["h"] | 1, 1, SCREEN_HEIGHT - item.y);
+                item.actualWidth = window["actualW"] | item.width;
+                item.actualHeight = window["actualH"] | item.height;
+                item.title = window["title"].as<String>();
+            }
+            bool layoutChanged = nextWindowCount != pcWindowCount;
+            for (int i = 0; !layoutChanged && i < nextWindowCount; ++i) {
+                const PcWindowLayoutItem& next = nextWindows[i];
+                int previousIndex = -1;
+                for (int j = 0; j < pcWindowCount; ++j) {
+                    if (pcWindows[j].id == next.id) { previousIndex = j; break; }
+                }
+                if (previousIndex < 0) {
+                    layoutChanged = true;
+                } else {
+                    const PcWindowLayoutItem& previous = pcWindows[previousIndex];
+                    layoutChanged = previous.x != next.x || previous.y != next.y
+                        || previous.width != next.width || previous.height != next.height
+                        || previous.actualWidth != next.actualWidth || previous.actualHeight != next.actualHeight;
+                }
+            }
+            if (layoutChanged) {
+                pcWindowCount = nextWindowCount;
+                for (int i = 0; i < pcWindowCount; ++i) pcWindows[i] = nextWindows[i];
+                pcWindowLayoutDirty = true;
             }
         }
         uint64_t sentEpochMs = doc["sentEpochMs"] | 0ULL;
@@ -1464,7 +1731,7 @@ void readDesktopCommands() {
             desktopCommandBuffer.trim();
             if (desktopCommandBuffer.length() > 0) handleDesktopCommand(desktopCommandBuffer);
             desktopCommandBuffer = "";
-        } else if (c != '\r' && desktopCommandBuffer.length() < 6144) {
+        } else if (c != '\r' && desktopCommandBuffer.length() < 10240) {
             desktopCommandBuffer += c;
         }
     }
@@ -1487,6 +1754,9 @@ void updateTimeFromSystemClock() {
 void setup() {
     Serial.begin(115200);
     timerPreferences.begin("timer", false);
+    uiPreferences.begin("ui", false);
+    lightMode = uiPreferences.getBool("light", false);
+    retroClock = uiPreferences.getBool("retro", false);
     loadTimerMemory();
     desktopCommandBuffer.reserve(6144);
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
@@ -1506,25 +1776,49 @@ void loop() {
     readDesktopCommands();
     if (millis() - lastTimeUpdate >= 1000) {
         if (!lyricActive) updateTimeFromSystemClock();
-        if (currentPage == 0 && !lyricActive) {
+        if (currentPage == PAGE_MUSIC_TIME && !lyricActive) {
             drawDisplay();
-        } else if (currentPage == 7 && !screenHidden) {
+        } else if (currentPage == PAGE_WORLD_TIME && !screenHidden) {
             refreshWorldTimePage();
         }
         lastTimeUpdate = millis();
     }
 
-    if (currentPage == 1 && millis() - lastInfoUpdate >= 1000) {
+    if (currentPage == PAGE_INFO && millis() - lastInfoUpdate >= 1000) {
         refreshInfoPage();
         lastInfoUpdate = millis();
     }
 
-    unsigned long pcRefreshInterval = pcFpsFullscreen ? 100UL : 250UL;
-    if (currentPage == 6 && pcStatusDirty && !screenHidden
-        && millis() - lastPcStatusDraw >= pcRefreshInterval) {
-        refreshPcStatusPage();
+    if (currentPage == PAGE_MUSIC_TIME && !lyricActive && audioSpectrumDirty && !screenHidden
+        && millis() - lastAudioSpectrumDraw >= 100) {
+        drawAudioSpectrumBackground();
+        audioSpectrumDirty = false;
+        lastAudioSpectrumDraw = millis();
+    }
+
+    // Keep PC telemetry and FPS views in step with the desktop sender's 50 ms cadence.
+    unsigned long pcRefreshInterval = 50UL;
+    bool pcPageNeedsRefresh = currentPage == PAGE_PC_STATUS ? pcStatusDirty
+        : (currentPage == PAGE_PC_LAYOUT && pcWindowLayoutDirty);
+    if (pcPageNeedsRefresh && !screenHidden && millis() - lastPcStatusDraw >= pcRefreshInterval) {
+        if (currentPage == PAGE_PC_LAYOUT) {
+            drawPcLayoutPage();
+            pcWindowLayoutDirty = false;
+            pcMouseDirty = false;
+            pcPreviousMouseX = pcMouseX; pcPreviousMouseY = pcMouseY;
+        } else {
+            refreshPcStatusPage();
+        }
         pcStatusDirty = false;
         lastPcStatusDraw = millis();
+    }
+    if (currentPage == PAGE_PC_LAYOUT && pcMouseDirty && !pcWindowLayoutDirty && !screenHidden) {
+        // Recompose the immutable window layout before drawing the new cursor,
+        // so the previous cursor pixels cannot leave a duplicate trail.
+        drawPcLayoutPage();
+        pcMouseDirty = false;
+        pcPreviousMouseX = pcMouseX;
+        pcPreviousMouseY = pcMouseY;
     }
 
     if (millis() - lastTelemetryUpdate >= 1000) {
@@ -1532,7 +1826,7 @@ void loop() {
         lastTelemetryUpdate = millis();
     }
 
-    if (currentPage == 5 && timerRunning && millis() - lastTimerDraw >= 250) {
+    if (currentPage == PAGE_TIMER && timerRunning && millis() - lastTimerDraw >= 250) {
         bool timerFinished = false;
         if (timerCountdownMode && currentTimerValue() == 0) {
             timerElapsedMs = countdownDurationMs;
@@ -1547,7 +1841,7 @@ void loop() {
         lastTimerDraw = millis();
     }
 
-    if (currentPage == 5 && timerAlarmActive && millis() - lastTimerAlarmToggle >= 500) {
+    if (currentPage == PAGE_TIMER && timerAlarmActive && millis() - lastTimerAlarmToggle >= 500) {
         timerAlarmRed = !timerAlarmRed;
         lastTimerAlarmToggle = millis();
         drawTimerValue();
@@ -1557,14 +1851,14 @@ void loop() {
         saveTimerMemory();
     }
 
-    if (currentPage == 3 && pendingPcControlAction.length()
+    if (currentPage == PAGE_PC_CONTROL && pendingPcControlAction.length()
         && millis() >= pendingPcControlUntil) {
         pendingPcControlAction = "";
         pendingPcControlUntil = 0;
         drawPcControlPage();
     }
 
-    if (currentPage == 2 && currentWeather.isValid) {
+    if (currentPage == PAGE_WEATHER && currentWeather.isValid) {
         unsigned long animationInterval = static_cast<unsigned long>(constrain(260.0f - currentWeather.windSpeedKmh * 8.0f, 70.0f, 260.0f));
         if (millis() - lastWindAnimation >= animationInterval) {
             windAnimationPhase = (windAnimationPhase + 3) % 27;
@@ -1573,16 +1867,19 @@ void loop() {
         }
     }
 
-    if (currentPage != 5 && currentPage != 6 && !screenHidden
+    if (pcAudioActive && millis() - lastPcAudioPacket > 1500) pcAudioActive = false;
+
+    if (currentPage != PAGE_TIMER && currentPage != PAGE_PC_STATUS && !pcAudioActive && !screenHidden
         && millis() - lastInteractionMillis >= SCREEN_IDLE_TIMEOUT) {
         screenHidden = true;
         digitalWrite(TFT_BL, LOW);
     }
 
-    if (currentPage == 0 && lyricActive && musicDurationSeconds > 0
-        && millis() - lastMusicProgressDraw >= 500) {
-        drawMusicProgress();
-        lastMusicProgressDraw = millis();
+    if (currentPage == PAGE_MUSIC_TIME && lyricActive && musicDurationSeconds > 0) {
+        if (millis() - lastMusicProgressDraw >= 500) {
+            drawMusicProgress();
+            lastMusicProgressDraw = millis();
+        }
     }
 
     if (touchscreen.touched()) {
@@ -1603,20 +1900,20 @@ void loop() {
                 int dx = p.x - startX;
                 int dy = p.y - startY;
 
-                if (currentPage == 1 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                if (currentPage == PAGE_INFO && abs(dy) > abs(dx) && abs(dy) > 200) {
                     // 信息页纵向滑动：实时滚动
                     scrollOffset += dy / 20;
                     scrollOffset = constrain(scrollOffset, -500, 0);
                     drawDisplay();
                     startY = p.y; // 更新起始点以平滑滚动
                     isSwiping = true; // 标记为滑动操作
-                } else if (currentPage == 2 && abs(dy) > abs(dx) && abs(dy) > 200) {
+                } else if (currentPage == PAGE_WEATHER && abs(dy) > abs(dx) && abs(dy) > 200) {
                     weatherScrollOffset += dy / 20;
                     weatherScrollOffset = constrain(weatherScrollOffset, -300, 0);
                     drawDisplay();
                     startY = p.y;
                     isSwiping = true;
-                } else if (currentPage == 6 && !pcFpsFullscreen
+                } else if (currentPage == PAGE_PC_STATUS && !pcFpsFullscreen
                            && abs(dy) > abs(dx) && abs(dy) > 200) {
                     pcScrollOffset += dy / 20;
                     pcScrollOffset = constrain(pcScrollOffset,
@@ -1640,9 +1937,9 @@ void loop() {
 
             // 只有当不是滑动操作时才处理点击
             if (!isSwiping) {
-                if (currentPage == 5 && abs(finalDx) < 200 && abs(finalDy) < 200) {
-                    int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
-                    int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
+                int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                if (currentPage == PAGE_TIMER && abs(finalDx) < 200 && abs(finalDy) < 200) {
                     if (screenY >= 145 && screenY <= 205) {
                         if (screenX < 105) {
                             if (timerRunning) timerElapsedMs += millis() - timerStartedAt;
@@ -1668,14 +1965,16 @@ void loop() {
                         saveTimerMemory();
                     }
                     drawDisplay();
-                } else if (currentPage == 6 && abs(finalDx) < 200 && abs(finalDy) < 200) {
-                    int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
-                    int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                } else if (currentPage == PAGE_PC_STATUS && abs(finalDx) < 200 && abs(finalDy) < 200) {
                     handlePcStatusTap(screenX, screenY);
-                } else if (currentPage == 3 && abs(finalDx) < 200 && abs(finalDy) < 200) {
-                    int screenX = constrain(map(finalX, 200, 3700, 0, SCREEN_WIDTH), 0, SCREEN_WIDTH - 1);
-                    int screenY = constrain(map(finalY, 240, 3800, 0, SCREEN_HEIGHT), 0, SCREEN_HEIGHT - 1);
+                } else if (currentPage == PAGE_PC_CONTROL && abs(finalDx) < 200 && abs(finalDy) < 200) {
                     handlePcControlTap(screenX, screenY);
+                } else if (currentPage == PAGE_SETTINGS && abs(finalDx) < 200 && abs(finalDy) < 200) {
+                    if (screenY >= 45 && screenY < 100) lightMode = !lightMode;
+                    else if (screenY >= 100 && screenY < 155) retroClock = !retroClock;
+                    uiPreferences.putBool("light", lightMode);
+                    uiPreferences.putBool("retro", retroClock);
+                    drawDisplay();
                 } else if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
                     // 音乐控制点击已处理
                 } else if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
@@ -1695,7 +1994,7 @@ void loop() {
                     lastTimeStr = ""; // 重置时间显示状态
                     drawDisplay();
                 }
-            } else if (currentPage == 6) {
+            } else if (currentPage == PAGE_PC_STATUS) {
                 drawDisplay();
             }
             
@@ -1707,7 +2006,7 @@ void loop() {
     }
 
     if (lyricActive && millis() - lastLyricTime > 15000) {
-        lyricActive = false; drawDisplay();
+        lyricActive = false; lyricSungBytes = 0; drawDisplay();
     }
 
     // 计算CPU使用率（每秒更新一次）
