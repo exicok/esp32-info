@@ -1344,6 +1344,7 @@ static void execute_pc_control(const char *action) {
     if (strcmp(action, "register") == 0) { set_autostart(1); return; }
     if (strcmp(action, "unregister") == 0) { set_autostart(0); return; }
     if (strcmp(action, "explorer") == 0) { ShellExecuteA(NULL, "open", "explorer.exe", NULL, NULL, SW_SHOWNORMAL); return; }
+    if (strcmp(action, "taskmgr") == 0) { ShellExecuteA(NULL, "open", "taskmgr.exe", NULL, NULL, SW_SHOWNORMAL); return; }
     if (strcmp(action, "alt-tab") == 0 || strcmp(action, "win-tab") == 0) {
         INPUT input[4]; BYTE modifier = strcmp(action, "win-tab") == 0 ? VK_LWIN : VK_MENU;
         ZeroMemory(input, sizeof(input));
@@ -1750,6 +1751,7 @@ static void handle_device_commands(HANDLE serial, COMSTAT *status) {
                 else if (strstr(buffer, "\"action\":\"register\"")) action = "register";
                 else if (strstr(buffer, "\"action\":\"unregister\"")) action = "unregister";
                 else if (strstr(buffer, "\"action\":\"explorer\"")) action = "explorer";
+                else if (strstr(buffer, "\"action\":\"taskmgr\"")) action = "taskmgr";
                 else if (strstr(buffer, "\"action\":\"alt-tab\"")) action = "alt-tab";
                 else if (strstr(buffer, "\"action\":\"win-tab\"")) action = "win-tab";
                 else if (strstr(buffer, "\"action\":\"restart\"")) action = "restart";
@@ -2224,7 +2226,7 @@ static LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM w_par
                 174, 272, 386, 220, window, (HMENU)GUI_PAGE_COMBO_ID, NULL, NULL);
             {
                 const char *pages[] = {"0 时间/音乐", "1 系统信息", "2 天气", "3 电脑控制",
-                    "4 日历", "5 计时", "6 电脑状态", "7 世界时间", "8 电脑窗口布局", "9 设置"};
+                    "4 日历", "5 计时", "6 电脑状态", "7 世界时间", "8 电脑窗口布局", "9 任务管理器"};
                 int i;
                 for (i = 0; i < 10; ++i) SendMessageA(g_gui_page_combo, CB_ADDSTRING, 0, (LPARAM)pages[i]);
                 refresh_page_combo_from_esp32();

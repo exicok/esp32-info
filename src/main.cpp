@@ -126,6 +126,7 @@ int pcPreviousMouseX = -1, pcPreviousMouseY = -1;
 const int PC_DETAIL_OFFSET = 212;
 const int AUDIO_SPECTRUM_BANDS = 24;
 uint8_t pcAudioSpectrum[AUDIO_SPECTRUM_BANDS] = {0};
+uint8_t previousAudioSpectrum[AUDIO_SPECTRUM_BANDS] = {0};
 bool audioSpectrumDirty = false;
 bool pcAudioActive = false;
 unsigned long lastPcAudioPacket = 0;
@@ -141,7 +142,7 @@ int currentPage = 0;
 #define PAGE_PC_STATUS 6
 #define PAGE_WORLD_TIME 7
 #define PAGE_PC_LAYOUT 8
-#define PAGE_SETTINGS 9
+#define PAGE_TASK_MANAGER 9
 #define MAX_PAGES 10
 
 // 电脑端仅在 RTSS 进程内存大于 4GB 时上报 FPS，避免误判普通桌面程序为游戏。
@@ -202,8 +203,7 @@ String lastTimerValueStr = "";
 uint16_t lastTimerBackground = 0xFFFF;
 Preferences timerPreferences;
 Preferences uiPreferences;
-bool lightMode = false;
-bool retroClock = false;
+bool taskManagerPage = false;
 String pendingPcControlAction = "";
 unsigned long pendingPcControlUntil = 0;
 
@@ -433,7 +433,7 @@ void drawWeatherPage();
 void drawPcStatusPage();
 void drawFpsFullscreen();
 void drawPcLayoutPage();
-void drawSettingsPage();
+void drawTaskManagerPage();
 void drawDisplay();
 
 String windDirectionDesc(float degrees) {
@@ -575,10 +575,14 @@ void drawAudioSpectrumBackground() {
     const int barWidth = (SCREEN_WIDTH - gap * (AUDIO_SPECTRUM_BANDS + 1)) / AUDIO_SPECTRUM_BANDS;
     for (int i = 0; i < AUDIO_SPECTRUM_BANDS; ++i) {
         int height = map(pcAudioSpectrum[i], 0, 255, 1, maxHeight);
+        int previousHeight = map(previousAudioSpectrum[i], 0, 255, 1, maxHeight);
         int x = gap + i * (barWidth + gap);
+        if (previousHeight > height)
+            tft.fillRect(x, SCREEN_HEIGHT - previousHeight, barWidth, previousHeight - height, TFT_BLACK);
         tft.fillRect(x, SCREEN_HEIGHT - height, barWidth, height,
                      tft.color565(8, 22 + i * 30 / AUDIO_SPECTRUM_BANDS,
                                   34 + i * 42 / AUDIO_SPECTRUM_BANDS));
+        previousAudioSpectrum[i] = pcAudioSpectrum[i];
     }
 }
 
@@ -613,9 +617,9 @@ bool sendPcControl(const char* action) {
 }
 
 void drawPcControlPage() {
-    const char* labels[] = {"播放/暂停", "最小化", "最大化", "关闭窗口", "注册登录", "注销登录",
-                            "资源管理器", "Alt+Tab", "Win+Tab", "重启电脑", "关闭电脑"};
-    const uint16_t colors[] = {TFT_CYAN, TFT_GREEN, TFT_GREEN, TFT_YELLOW, TFT_ORANGE, TFT_ORANGE,
+    const char* labels[] = {"播放/暂停", "最小化", "最大化", "停止", "注册登录", "注销登录",
+                            "资源管理器", "任务管理器", "Alt+Tab", "Win+Tab", "重启电脑", "关闭电脑"};
+    const uint16_t colors[] = {TFT_CYAN, TFT_GREEN, TFT_GREEN, TFT_RED, TFT_ORANGE, TFT_ORANGE,
                                TFT_CYAN, TFT_CYAN, TFT_CYAN, TFT_ORANGE, TFT_RED};
     tft.fillScreen(TFT_BLACK);
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
@@ -629,7 +633,7 @@ void drawPcControlPage() {
         u8f.setCursor(88, 24); u8f.print("窗口操作作用于鼠标所在窗口");
     }
     const int columns = 3, cardWidth = 100, cardHeight = 38, cardGapX = 6, cardGapY = 7;
-    for (int i = 0; i < 11; ++i) {
+    for (int i = 0; i < 12; ++i) {
         int x = 8 + (i % columns) * (cardWidth + cardGapX);
         int y = 38 + (i / columns) * (cardHeight + cardGapY);
         tft.drawRoundRect(x, y, cardWidth, cardHeight, 5, colors[i]);
@@ -641,7 +645,7 @@ void drawPcControlPage() {
 
 bool handlePcControlTap(int screenX, int screenY) {
     const char* actions[] = {"media-play-pause", "minimize", "maximize", "close", "register", "unregister",
-                             "explorer", "alt-tab", "win-tab", "restart", "shutdown"};
+                             "explorer", "taskmgr", "alt-tab", "win-tab", "restart", "shutdown"};
     const int columns = 3, cardWidth = 100, cardHeight = 38, cardGapX = 6, cardGapY = 7;
     if (screenX < 8 || screenX >= 8 + columns * cardWidth + (columns - 1) * cardGapX || screenY < 38) return false;
     int column = (screenX - 8) / (cardWidth + cardGapX);
@@ -649,9 +653,9 @@ bool handlePcControlTap(int screenX, int screenY) {
     int row = (screenY - 38) / (cardHeight + cardGapY);
     if ((screenY - 38) % (cardHeight + cardGapY) >= cardHeight) return false;
     int index = row * columns + column;
-    if (index >= 11) return false;
+    if (index >= 12) return false;
     String action = actions[index];
-    if (index >= 9) {
+    if (index >= 10) {
         if (pendingPcControlAction == action && millis() < pendingPcControlUntil) {
             sendPcControl(actions[index]);
             pendingPcControlAction = "";
@@ -1209,17 +1213,20 @@ void drawPcLayoutPage() {
     }
 }
 
-void drawSettingsPage() {
-    tft.fillScreen(lightMode ? TFT_WHITE : TFT_BLACK);
-    u8f.setFontMode(1); u8f.setBackgroundColor(lightMode ? TFT_WHITE : TFT_BLACK);
-    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(lightMode ? TFT_BLACK : TFT_CYAN);
-    u8f.setCursor(12, 30); u8f.print("设置");
-    u8f.setFont(u8g2_font_wqy12_t_gb2312);
-    u8f.setForegroundColor(lightMode ? TFT_BLACK : TFT_WHITE);
-    u8f.setCursor(18, 76); u8f.print(String("显示模式: ") + (lightMode ? "亮色模式" : "深色模式"));
-    u8f.setCursor(18, 126); u8f.print(String("时间样式: ") + (retroClock ? "复古风格" : "标准风格"));
-    u8f.setForegroundColor(lightMode ? TFT_BLUE : TFT_YELLOW);
-    u8f.setCursor(18, 190); u8f.print("点击上方选项切换");
+void drawTaskManagerPage() {
+    tft.fillScreen(TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
+    u8f.setCursor(12, 25); u8f.print("任务管理器");
+    u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_WHITE);
+    for (int i = 0; i < pcWindowCount && i < 8; ++i) {
+        int y = 48 + i * 23;
+        u8f.setForegroundColor(i == 0 ? TFT_YELLOW : TFT_LIGHTGREY);
+        u8f.setCursor(12, y);
+        u8f.print(String(i + 1) + ". " + pcWindows[i].title.substring(0, 22));
+        u8f.setCursor(220, y);
+        u8f.print(String(pcWindows[i].actualWidth) + "x" + String(pcWindows[i].actualHeight));
+    }
 }
 
 void refreshPcLayoutMouse() {
@@ -1290,13 +1297,12 @@ void drawDisplay() {
             tft.setTextDatum(TC_DATUM);
             tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
             tft.drawString(currentDateStr, SCREEN_WIDTH / 2, 164);
-            tft.setTextSize(retroClock ? 6 : 5);
+            tft.setTextSize(5);
             tft.setTextDatum(CC_DATUM);
             
             if (lastTimeStr.length() != currentTimeStr.length()) {
                 tft.fillScreen(TFT_BLACK);
-            tft.setTextColor(lightMode ? TFT_BLACK : (retroClock ? TFT_ORANGE : TFT_WHITE),
-                             lightMode ? TFT_WHITE : TFT_BLACK);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
                 tft.drawString(currentTimeStr, 160, y);
                 tft.setTextSize(1); tft.setTextDatum(TC_DATUM);
                 tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
@@ -1335,8 +1341,8 @@ void drawDisplay() {
         drawPcStatusPage();
     } else if (currentPage == PAGE_PC_LAYOUT) {
         drawPcLayoutPage();
-    } else if (currentPage == PAGE_SETTINGS) {
-        drawSettingsPage();
+    } else if (currentPage == PAGE_TASK_MANAGER) {
+        drawTaskManagerPage();
     } else if (currentPage == PAGE_WORLD_TIME) {
         drawWorldTimePage();
     }
@@ -1454,9 +1460,8 @@ String buildScreenPreviewText() {
                  + "\nGPU: " + String(pcGpuUsage, 1) + "%";
         case PAGE_PC_LAYOUT:
             return "电脑窗口布局（仅窗口方框）\n窗口数量: " + String(pcWindowCount);
-        case PAGE_SETTINGS:
-            return "设置\n显示模式: " + String(lightMode ? "亮色模式" : "深色模式")
-                 + "\n时间样式: " + String(retroClock ? "复古风格" : "标准风格");
+        case PAGE_TASK_MANAGER:
+            return "任务管理器\n运行窗口: " + String(pcWindowCount);
         case PAGE_WORLD_TIME: {
             String text = "世界时间";
             time_t utcNow = time(nullptr);
@@ -1755,8 +1760,6 @@ void setup() {
     Serial.begin(115200);
     timerPreferences.begin("timer", false);
     uiPreferences.begin("ui", false);
-    lightMode = uiPreferences.getBool("light", false);
-    retroClock = uiPreferences.getBool("retro", false);
     loadTimerMemory();
     desktopCommandBuffer.reserve(6144);
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
@@ -1790,7 +1793,7 @@ void loop() {
     }
 
     if (currentPage == PAGE_MUSIC_TIME && !lyricActive && audioSpectrumDirty && !screenHidden
-        && millis() - lastAudioSpectrumDraw >= 100) {
+        && millis() - lastAudioSpectrumDraw >= 33) {
         drawAudioSpectrumBackground();
         audioSpectrumDirty = false;
         lastAudioSpectrumDraw = millis();
@@ -1799,13 +1802,16 @@ void loop() {
     // Keep PC telemetry and FPS views in step with the desktop sender's 50 ms cadence.
     unsigned long pcRefreshInterval = 50UL;
     bool pcPageNeedsRefresh = currentPage == PAGE_PC_STATUS ? pcStatusDirty
-        : (currentPage == PAGE_PC_LAYOUT && pcWindowLayoutDirty);
+        : ((currentPage == PAGE_PC_LAYOUT || currentPage == PAGE_TASK_MANAGER) && pcWindowLayoutDirty);
     if (pcPageNeedsRefresh && !screenHidden && millis() - lastPcStatusDraw >= pcRefreshInterval) {
         if (currentPage == PAGE_PC_LAYOUT) {
             drawPcLayoutPage();
             pcWindowLayoutDirty = false;
             pcMouseDirty = false;
             pcPreviousMouseX = pcMouseX; pcPreviousMouseY = pcMouseY;
+        } else if (currentPage == PAGE_TASK_MANAGER) {
+            drawTaskManagerPage();
+            pcWindowLayoutDirty = false;
         } else {
             refreshPcStatusPage();
         }
@@ -1969,12 +1975,6 @@ void loop() {
                     handlePcStatusTap(screenX, screenY);
                 } else if (currentPage == PAGE_PC_CONTROL && abs(finalDx) < 200 && abs(finalDy) < 200) {
                     handlePcControlTap(screenX, screenY);
-                } else if (currentPage == PAGE_SETTINGS && abs(finalDx) < 200 && abs(finalDy) < 200) {
-                    if (screenY >= 45 && screenY < 100) lightMode = !lightMode;
-                    else if (screenY >= 100 && screenY < 155) retroClock = !retroClock;
-                    uiPreferences.putBool("light", lightMode);
-                    uiPreferences.putBool("retro", retroClock);
-                    drawDisplay();
                 } else if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
                     // 音乐控制点击已处理
                 } else if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
