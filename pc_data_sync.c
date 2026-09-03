@@ -1612,7 +1612,7 @@ static void refresh_screen_toggle_ui(void) {
 
 static void refresh_page_combo_from_esp32(void) {
     int page = (int)InterlockedCompareExchange(&g_esp32_current_page, 0, 0);
-    if (!g_gui_page_combo || page < 0 || page >= 10) return;
+    if (!g_gui_page_combo || page < 0 || page >= 8) return;
     SendMessageA(g_gui_page_combo, CB_SETCURSEL, page, 0);
 }
 
@@ -1706,7 +1706,7 @@ static void update_esp32_state_from_line(const char *line) {
 
     if (json_number(line, "\"currentPage\":", &page)) {
         int current_page = (int)page;
-        if (current_page >= 0 && current_page < 10) {
+        if (current_page >= 0 && current_page < 8) {
             InterlockedExchange(&g_esp32_current_page, current_page);
             changed = 1;
         }
@@ -2225,10 +2225,10 @@ static LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM w_par
             g_gui_page_combo = CreateWindowA("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
                 174, 272, 386, 220, window, (HMENU)GUI_PAGE_COMBO_ID, NULL, NULL);
             {
-                const char *pages[] = {"0 时间/音乐", "1 系统信息", "2 天气", "3 电脑控制",
-                    "4 日历", "5 计时", "6 电脑状态", "7 世界时间", "8 电脑窗口布局", "9 任务管理器"};
+                const char *pages[] = {"0 时间/音乐", "1 系统信息", "2 天气", "3 日历",
+                    "4 计时", "5 电脑状态", "6 电脑窗口布局", "7 任务管理器"};
                 int i;
-                for (i = 0; i < 10; ++i) SendMessageA(g_gui_page_combo, CB_ADDSTRING, 0, (LPARAM)pages[i]);
+                for (i = 0; i < 8; ++i) SendMessageA(g_gui_page_combo, CB_ADDSTRING, 0, (LPARAM)pages[i]);
                 refresh_page_combo_from_esp32();
             }
             CreateWindowA("STATIC", "ESP32 屏幕内容", WS_CHILD | WS_VISIBLE,

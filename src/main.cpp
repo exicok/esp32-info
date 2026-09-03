@@ -38,8 +38,10 @@ String currentLyric = "";
 String currentTranslation = "";
 uint16_t currentLyricColor = TFT_YELLOW;
 uint8_t currentLyricFontSize = 16;
-int lyricSungBytes = 0;              // 电脑版音乐软件发送的已唱 UTF-8 字节数
+int lyricSungBytes = 0;              // 电脑版音乐软件按 LRC 时间轴发送的已唱 UTF-8 字节数
 uint16_t lyricSungColor = TFT_CYAN;  // 已唱部分的颜色
+int lyricDrawnSungBytes = 0;         // 已叠加绘制过高亮的字节数(增量刷新用)
+int lyricBaseY = -1;                 // 当前歌词首行基线(全量绘制时缓存)
 bool musicIsPlaying = false;
 float musicProgressSeconds = 0;
 float musicDurationSeconds = 0;
@@ -102,7 +104,9 @@ int pcScrollOffset = 0;
 bool pcStatusDirty = false;
 unsigned long lastPcStatusDraw = 0;
 unsigned long lastPcScrollDraw = 0;
+unsigned long lastTaskManagerStatsDraw = 0;
 float pcCpuHistory[36] = {0};
+float pcMemoryHistory[36] = {0};
 float pcGpuHistory[36] = {0};
 float pcFpsHistory[36] = {0};
 float pcGpuHistories[4][36] = {{0}};
@@ -131,37 +135,20 @@ bool audioSpectrumDirty = false;
 bool pcAudioActive = false;
 unsigned long lastPcAudioPacket = 0;
 unsigned long lastAudioSpectrumDraw = 0;
+unsigned long lastClockFpsDraw = 0;   // 时间页顶部 FPS 区独立刷新节流
 
 int currentPage = 0;
 #define PAGE_MUSIC_TIME 0
 #define PAGE_INFO 1
 #define PAGE_WEATHER 2
-#define PAGE_PC_CONTROL 3
-#define PAGE_CALENDAR 4
-#define PAGE_TIMER 5
-#define PAGE_PC_STATUS 6
-#define PAGE_WORLD_TIME 7
-#define PAGE_PC_LAYOUT 8
-#define PAGE_TASK_MANAGER 9
-#define MAX_PAGES 10
+#define PAGE_CALENDAR 3
+#define PAGE_TIMER 4
+#define PAGE_PC_STATUS 5
+#define PAGE_PC_LAYOUT 6
+#define PAGE_TASK_MANAGER 7
+#define MAX_PAGES 8
 
 // 电脑端仅在 RTSS 进程内存大于 4GB 时上报 FPS，避免误判普通桌面程序为游戏。
-
-struct WorldClockRow {
-    const char* name;
-    int utcOffsetHours;
-    uint16_t color;
-};
-const WorldClockRow WORLD_CLOCK_ROWS[] = {
-    {"中国北京 UTC+8", 8, TFT_YELLOW},
-    {"世界标准 UTC+0", 0, TFT_WHITE},
-    {"英国伦敦 UTC+0", 0, TFT_GREEN},
-    {"美国纽约 UTC-5", -5, TFT_CYAN},
-    {"日本东京 UTC+9", 9, TFT_MAGENTA},
-    {"澳洲悉尼 UTC+10", 10, TFT_ORANGE}
-};
-String worldClockRenderedValues[6];
-bool worldClockLayoutReady = false;
 
 // 天气数据结构
 struct WeatherData {
@@ -204,8 +191,6 @@ uint16_t lastTimerBackground = 0xFFFF;
 Preferences timerPreferences;
 Preferences uiPreferences;
 bool taskManagerPage = false;
-String pendingPcControlAction = "";
-unsigned long pendingPcControlUntil = 0;
 
 int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int lineHeight);
 
@@ -286,22 +271,46 @@ int drawWrappedTextCentered(String text, int centerX, int startY, int maxW, int 
     return lineCount;
 }
 
-// 逐字歌词：sungBytes 之前的字符用 sungColor，其余用 waitingColor。
-// 换行规则与 drawWrappedTextCentered 一致，返回绘制的行数。
-int drawWrappedLyricCentered(const String& text, int sungBytes, int centerX, int startY,
-                             int maxW, int lineHeight, uint16_t waitingColor, uint16_t sungColor) {
+// 卡拉OK歌词换行行数测量(规则与 drawWrappedTextCentered 一致,不绘制)。
+int countWrappedLines(const String& text, int maxW) {
     int lineCount = 0;
-    int lineStart = 0;       // 当前行在 text 中的起始字节
+    String currentLine = "";
+    int i = 0;
+    while (i < (int)text.length()) {
+        int charLen = getUtf8CharLen(text[i]);
+        String ch = text.substring(i, i + charLen);
+        i += charLen;
+        String testLine = currentLine + ch;
+        if (u8f.getUTF8Width(testLine.c_str()) > maxW && currentLine.length() > 0) {
+            lineCount++;
+            currentLine = ch;
+        } else {
+            currentLine = testLine;
+        }
+    }
+    if (currentLine.length() > 0) lineCount++;
+    return lineCount;
+}
+
+// 已唱部分叠加层:把本行 [0, toBytes) 前缀用 sungColor 叠画在灰色底稿上。
+// 关键:必须从行首原 x 坐标整段绘制前缀(与灰底稿同一 print 路径、逐字推进一致),
+// 不能按 getUTF8Width(前缀) 平移起点后只画新增字符——累计偏差会让窄字形(i/l)错位重影。
+// fromBytes 仅用于跳过没有新增内容的行;重复叠画已唱字符颜色相同,无副作用。
+void drawSungOverlayRange(const String& text, int fromBytes, int toBytes, int centerX, int startY,
+                          int maxW, int lineHeight, uint16_t sungColor) {
+    if (toBytes <= fromBytes) return;
+    u8f.setForegroundColor(sungColor);
+    int lineCount = 0;
+    int lineStart = 0;   // 当前行在 text 中的起始字节
     int i = 0;
     String currentLine = "";
     while (i <= (int)text.length()) {
         bool flush = (i == (int)text.length());
-        String ch;
         if (!flush) {
             int charLen = getUtf8CharLen(text[i]);
-            ch = text.substring(i, i + charLen);
+            String ch = text.substring(i, i + charLen);
             if (u8f.getUTF8Width((currentLine + ch).c_str()) > maxW && currentLine.length() > 0) {
-                flush = true;    // 本行放不下，先输出再把该字符放到下一行
+                flush = true;    // 本行放不下,先输出再把该字符放到下一行
             } else {
                 currentLine += ch;
                 i += charLen;
@@ -309,30 +318,25 @@ int drawWrappedLyricCentered(const String& text, int sungBytes, int centerX, int
             }
         }
         if (currentLine.length() > 0) {
-            int x = centerX - u8f.getUTF8Width(currentLine.c_str()) / 2;
-            int y = startY + lineCount * lineHeight;
-            int sungInLine = sungBytes - lineStart;
-            if (sungInLine < 0) sungInLine = 0;
-            if (sungInLine > (int)currentLine.length()) sungInLine = (int)currentLine.length();
-            if (sungInLine > 0) {
-                String sung = currentLine.substring(0, sungInLine);
-                u8f.setForegroundColor(sungColor);
-                u8f.setCursor(x, y);
-                u8f.print(sung);
-                x += u8f.getUTF8Width(sung.c_str());
-            }
-            if (sungInLine < (int)currentLine.length()) {
-                u8f.setForegroundColor(waitingColor);
-                u8f.setCursor(x, y);
-                u8f.print(currentLine.substring(sungInLine));
+            int lineEnd = lineStart + currentLine.length();
+            if (toBytes > lineStart && fromBytes < lineEnd) {
+                int sungInLine = toBytes - lineStart;
+                if (sungInLine > (int)currentLine.length()) sungInLine = currentLine.length();
+                int x = centerX - u8f.getUTF8Width(currentLine.c_str()) / 2;
+                u8f.setCursor(x, startY + lineCount * lineHeight);
+                u8f.print(currentLine.substring(0, sungInLine));
             }
             lineCount++;
-            lineStart += currentLine.length();
+            lineStart = lineEnd;
             currentLine = "";
         }
         if (i == (int)text.length()) break;
     }
-    return lineCount;
+}
+
+void drawSungOverlay(const String& text, int sungBytes, int centerX, int startY,
+                     int maxW, int lineHeight, uint16_t sungColor) {
+    drawSungOverlayRange(text, 0, sungBytes, centerX, startY, maxW, lineHeight, sungColor);
 }
 
 void drawTaskbar() {
@@ -434,6 +438,8 @@ void drawPcStatusPage();
 void drawFpsFullscreen();
 void drawPcLayoutPage();
 void drawTaskManagerPage();
+void drawTaskManagerStats();
+void refreshTaskManagerStats();
 void drawDisplay();
 
 String windDirectionDesc(float degrees) {
@@ -560,6 +566,20 @@ void drawMusicControls() {
     }
 }
 
+// 时间页(时钟模式)顶部 FPS 区:电脑端有 FPS 数据(pcFps >= 0)才显示,
+// 进入歌词/熄屏时自动隐藏。只自绘顶部小区域,独立于时间/日期局部刷新。
+void drawClockFpsArea() {
+    if (currentPage != PAGE_MUSIC_TIME || lyricActive || screenHidden) return;
+    const int areaY = 30, areaH = 40;
+    tft.fillRect(0, areaY, SCREEN_WIDTH, areaH, TFT_BLACK);
+    if (pcFps < 0) return;
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.drawString("FPS " + String(pcFps, 0), SCREEN_WIDTH / 2, areaY + areaH / 2);
+    tft.setTextSize(1);
+}
+
 void drawMusicProgress() {
     if (!lyricActive || musicDurationSeconds <= 0) return;
     float progress = constrain(estimatedMusicProgressSeconds() / musicDurationSeconds, 0.0f, 1.0f);
@@ -605,71 +625,6 @@ bool handleMusicControlTap(int rawX, int rawY) {
     if (screenX >= 125 && screenX <= 195) return sendMusicControl("play-pause");
     if (screenX >= 205 && screenX <= 275) return sendMusicControl("next");
     return false;
-}
-
-bool sendPcControl(const char* action) {
-    StaticJsonDocument<96> doc;
-    doc["type"] = "pc_control";
-    doc["action"] = action;
-    serializeJson(doc, Serial);
-    Serial.println();
-    return true;
-}
-
-void drawPcControlPage() {
-    const char* labels[] = {"播放/暂停", "最小化", "最大化", "停止", "注册登录", "注销登录",
-                            "资源管理器", "任务管理器", "Alt+Tab", "Win+Tab", "重启电脑", "关闭电脑"};
-    const uint16_t colors[] = {TFT_CYAN, TFT_GREEN, TFT_GREEN, TFT_RED, TFT_ORANGE, TFT_ORANGE,
-                               TFT_CYAN, TFT_CYAN, TFT_CYAN, TFT_ORANGE, TFT_RED};
-    tft.fillScreen(TFT_BLACK);
-    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
-    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
-    u8f.setCursor(12, 24); u8f.print("电脑控制");
-    u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
-    if (pendingPcControlAction.length() && millis() < pendingPcControlUntil) {
-        u8f.setForegroundColor(TFT_YELLOW); u8f.setCursor(105, 24); u8f.print("再次点击确认");
-    } else {
-        pendingPcControlAction = "";
-        u8f.setCursor(88, 24); u8f.print("窗口操作作用于鼠标所在窗口");
-    }
-    const int columns = 3, cardWidth = 100, cardHeight = 38, cardGapX = 6, cardGapY = 7;
-    for (int i = 0; i < 12; ++i) {
-        int x = 8 + (i % columns) * (cardWidth + cardGapX);
-        int y = 38 + (i / columns) * (cardHeight + cardGapY);
-        tft.drawRoundRect(x, y, cardWidth, cardHeight, 5, colors[i]);
-        u8f.setForegroundColor(colors[i]);
-        int textWidth = u8f.getUTF8Width(labels[i]);
-        u8f.setCursor(x + (cardWidth - textWidth) / 2, y + 25); u8f.print(labels[i]);
-    }
-}
-
-bool handlePcControlTap(int screenX, int screenY) {
-    const char* actions[] = {"media-play-pause", "minimize", "maximize", "close", "register", "unregister",
-                             "explorer", "taskmgr", "alt-tab", "win-tab", "restart", "shutdown"};
-    const int columns = 3, cardWidth = 100, cardHeight = 38, cardGapX = 6, cardGapY = 7;
-    if (screenX < 8 || screenX >= 8 + columns * cardWidth + (columns - 1) * cardGapX || screenY < 38) return false;
-    int column = (screenX - 8) / (cardWidth + cardGapX);
-    if ((screenX - 8) % (cardWidth + cardGapX) >= cardWidth) return false;
-    int row = (screenY - 38) / (cardHeight + cardGapY);
-    if ((screenY - 38) % (cardHeight + cardGapY) >= cardHeight) return false;
-    int index = row * columns + column;
-    if (index >= 12) return false;
-    String action = actions[index];
-    if (index >= 10) {
-        if (pendingPcControlAction == action && millis() < pendingPcControlUntil) {
-            sendPcControl(actions[index]);
-            pendingPcControlAction = "";
-            pendingPcControlUntil = 0;
-        } else {
-            pendingPcControlAction = action;
-            pendingPcControlUntil = millis() + 4000;
-        }
-        drawPcControlPage();
-        return true;
-    }
-    pendingPcControlAction = "";
-    pendingPcControlUntil = 0;
-    return sendPcControl(actions[index]);
 }
 
 bool handlePcStatusTap(int screenX, int screenY) {
@@ -740,61 +695,6 @@ void drawCalendarPage() {
         String marker = makeupWorkday ? "班" : (holiday.length() ? holiday : (holidayBreak ? "休" : ""));
         if (marker.length()) { u8f.setCursor(x - 5, y + 13); u8f.print(marker); }
     }
-}
-
-String formatWorldTime(time_t utcNow, int utcOffsetHours) {
-    time_t localTime = utcNow + static_cast<time_t>(utcOffsetHours) * 3600;
-    struct tm value;
-    gmtime_r(&localTime, &value);
-    char buffer[24];
-    strftime(buffer, sizeof(buffer), "%m-%d %H:%M:%S", &value);
-    return String(buffer);
-}
-
-void drawWorldTimePage();
-
-void refreshWorldTimePage() {
-    if (!desktopTimeSynced) return;
-    if (!worldClockLayoutReady) {
-        drawWorldTimePage();
-        return;
-    }
-
-    time_t utcNow = time(nullptr);
-    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
-    u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_WHITE);
-    for (int i = 0; i < 6; ++i) {
-        String value = formatWorldTime(utcNow, WORLD_CLOCK_ROWS[i].utcOffsetHours);
-        if (value == worldClockRenderedValues[i]) continue;
-        int y = 52 + i * 30;
-        tft.fillRect(186, y - 16, 132, 20, TFT_BLACK);
-        u8f.setCursor(188, y); u8f.print(value);
-        worldClockRenderedValues[i] = value;
-    }
-}
-
-void drawWorldTimePage() {
-    tft.fillScreen(TFT_BLACK);
-    worldClockLayoutReady = false;
-    for (int i = 0; i < 6; ++i) worldClockRenderedValues[i] = "";
-    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
-    u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
-    u8f.setCursor(12, 22); u8f.print("世界时间（北京时间换算）");
-
-    if (!desktopTimeSynced) {
-        u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_YELLOW);
-        u8f.setCursor(68, 125); u8f.print("等待北京时间同步...");
-        return;
-    }
-
-    u8f.setFont(u8g2_font_wqy12_t_gb2312);
-    for (int i = 0; i < 6; ++i) {
-        int y = 52 + i * 30;
-        u8f.setForegroundColor(WORLD_CLOCK_ROWS[i].color);
-        u8f.setCursor(10, y); u8f.print(WORLD_CLOCK_ROWS[i].name);
-    }
-    worldClockLayoutReady = true;
-    refreshWorldTimePage();
 }
 
 unsigned long currentTimerValue() {
@@ -1213,14 +1113,50 @@ void drawPcLayoutPage() {
     }
 }
 
+// 任务管理器页顶部统计区：CPU/内存/GPU 三个迷你曲线面板 + 容量明细行。
+String pcGbCapacityText(int usedMB, int totalMB) {
+    if (totalMB <= 0) return "--";
+    return String(usedMB / 1024.0f, 1) + "/" + String(totalMB / 1024.0f, 1) + "G";
+}
+
+void drawTaskManagerStats() {
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    const char* labels[] = {"CPU", "内存", "GPU"};
+    float values[] = {pcCpuUsage, pcMemoryUsage, pcGpuUsage};
+    const float* histories[] = {pcCpuHistory, pcMemoryHistory, pcGpuHistory};
+    const uint16_t colors[] = {TFT_GREEN, TFT_ORANGE, TFT_CYAN};
+    for (int i = 0; i < 3; ++i) {
+        int x = 8 + i * 104;
+        u8f.setForegroundColor(colors[i]);
+        u8f.setCursor(x, 42);
+        u8f.print(String(labels[i]) + " " + String(values[i], 1) + "%");
+        drawBufferedPcGraph(x, 46, 96, 30, histories[i], 100.0f, colors[i]);
+    }
+    u8f.setForegroundColor(TFT_LIGHTGREY);
+    u8f.setCursor(8, 92);
+    u8f.print("内存 " + pcGbCapacityText(pcMemoryUsedMB, pcMemoryTotalMB)
+        + "  显存 " + pcGbCapacityText(pcGpuDedicatedUsedMBs[0], pcGpuMemoryMBs[0]));
+}
+
+// 只刷新顶部统计区（曲线与文字），窗口列表不动，避免整屏重绘闪烁。
+void refreshTaskManagerStats() {
+    tft.fillRect(0, 28, SCREEN_WIDTH, 68, TFT_BLACK);
+    drawTaskManagerStats();
+}
+
 void drawTaskManagerPage() {
     tft.fillScreen(TFT_BLACK);
     u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
     u8f.setFont(u8g2_font_wqy14_t_gb2312); u8f.setForegroundColor(TFT_CYAN);
     u8f.setCursor(12, 25); u8f.print("任务管理器");
-    u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_WHITE);
-    for (int i = 0; i < pcWindowCount && i < 8; ++i) {
-        int y = 48 + i * 23;
+    u8f.setFont(u8g2_font_wqy12_t_gb2312);
+    String countText = "窗口 " + String(pcWindowCount);
+    u8f.setForegroundColor(TFT_DARKGREY);
+    u8f.setCursor(SCREEN_WIDTH - u8f.getUTF8Width(countText.c_str()) - 12, 25);
+    u8f.print(countText);
+    drawTaskManagerStats();
+    for (int i = 0; i < pcWindowCount && i < 6; ++i) {
+        int y = 110 + i * 23;
         u8f.setForegroundColor(i == 0 ? TFT_YELLOW : TFT_LIGHTGREY);
         u8f.setCursor(12, y);
         u8f.print(String(i + 1) + ". " + pcWindows[i].title.substring(0, 22));
@@ -1254,10 +1190,10 @@ void refreshPcLayoutMouse() {
     pcPreviousMouseX = pcMouseX; pcPreviousMouseY = pcMouseY;
 }
 
-// 只重绘歌词区域（不动进度条与控制按钮），用于逐字高亮推进时避免整屏闪烁。
-void drawLyricArea() {
-    tft.fillRect(0, 40, SCREEN_WIDTH, 134, TFT_BLACK);
-    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+// 底部灰色歌词 + 已唱部分亮色叠加(卡拉OK式)。整句未开始时全灰。
+// 只自绘歌词区(0,40,320,134):进度条/控制按钮/时间页 FPS 区均不受影响,
+// 逐字推进时文字独立刷新,无整屏/整页重绘。
+void setLyricFont() {
     switch (currentLyricFontSize) {
         case 12: u8f.setFont(u8g2_font_wqy12_t_gb2312); break;
         case 13: u8f.setFont(u8g2_font_wqy13_t_gb2312); break;
@@ -1265,13 +1201,66 @@ void drawLyricArea() {
         case 15: u8f.setFont(u8g2_font_wqy15_t_gb2312); break;
         default: u8f.setFont(u8g2_font_wqy16_t_gb2312); break;
     }
-    int lyricLines = drawWrappedLyricCentered(currentLyric, lyricSungBytes, 160, 70,
-                                              SCREEN_WIDTH - 20, 20,
-                                              currentLyricColor, lyricSungColor);
+}
+
+void drawLyricArea() {
+    tft.fillRect(0, 40, SCREEN_WIDTH, 134, TFT_BLACK);
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    if (currentLyric.length() == 0) return;
+
+    // 统计原文/翻译行数(需先设置与绘制一致的字体再测量宽度)。
+    setLyricFont();
+    int lyricLines = countWrappedLines(currentLyric, SCREEN_WIDTH - 20);
+    int transLines = 0;
     if (currentTranslation.length() > 0) {
-        u8f.setFont(u8g2_font_wqy12_t_gb2312); u8f.setForegroundColor(TFT_LIGHTGREY);
-        drawWrappedTextCentered(currentTranslation, 160, 70 + lyricLines * 20 + 8, SCREEN_WIDTH - 20, 18);
+        u8f.setFont(u8g2_font_wqy12_t_gb2312);
+        transLines = countWrappedLines(currentTranslation, SCREEN_WIDTH - 20);
     }
+
+    // 垂直居中:整块(原文+翻译)在歌词区(40..174)内上下居中。
+    // 以基线推算视觉块中心(字形上伸约 13px、下延约 3px),令其落在区域中线。
+    const int lyricLineH = 20, transLineH = 16;
+    const int areaCenter = (40 + 174) / 2;
+    int lastBaselineOffset = (lyricLines - 1) * lyricLineH;
+    if (transLines > 0) lastBaselineOffset = lyricLines * lyricLineH + 4 + (transLines - 2) * transLineH;
+    int lyricStartY = areaCenter + 5 - lastBaselineOffset / 2;
+    int transStartY = -1;
+    if (transLines > 0) transStartY = lyricStartY + lyricLines * lyricLineH + 4 - transLineH;
+    if (lyricStartY < 44) lyricStartY = 44; // 超长句保护:从顶部顺排,不画进 40 上方
+
+    // 灰色整句底稿(背景字:仅在整句/布局变化时由本函数重画一次)
+    lyricBaseY = lyricStartY;
+    lyricDrawnSungBytes = 0;
+    setLyricFont();
+    u8f.setForegroundColor(tft.color565(100, 100, 100));
+    drawWrappedTextCentered(currentLyric, SCREEN_WIDTH / 2, lyricStartY,
+                            SCREEN_WIDTH - 20, lyricLineH);
+    // 已唱部分叠加(亮色字形覆盖灰字)
+    drawSungOverlay(currentLyric, lyricSungBytes, SCREEN_WIDTH / 2, lyricStartY,
+                    SCREEN_WIDTH - 20, lyricLineH, lyricSungColor);
+    lyricDrawnSungBytes = lyricSungBytes;
+    // 翻译小灰字
+    if (transLines > 0) {
+        u8f.setFont(u8g2_font_wqy12_t_gb2312);
+        u8f.setForegroundColor(tft.color565(150, 150, 150));
+        drawWrappedTextCentered(currentTranslation, SCREEN_WIDTH / 2, transStartY,
+                                SCREEN_WIDTH - 20, transLineH);
+    }
+}
+
+// 逐字推进:背景灰字不重画,只把新唱的单字用高亮色叠画上去。
+// 进度回退(换曲/拖动)时回退为全量重绘。
+void advanceLyricSung() {
+    if (lyricBaseY < 0 || lyricSungBytes < lyricDrawnSungBytes) {
+        drawLyricArea();
+        return;
+    }
+    if (lyricSungBytes == lyricDrawnSungBytes) return;
+    setLyricFont();
+    u8f.setFontMode(1); u8f.setBackgroundColor(TFT_BLACK);
+    drawSungOverlayRange(currentLyric, lyricDrawnSungBytes, lyricSungBytes,
+                         SCREEN_WIDTH / 2, lyricBaseY, SCREEN_WIDTH - 20, 20, lyricSungColor);
+    lyricDrawnSungBytes = lyricSungBytes;
 }
 
 void drawDisplay() {
@@ -1324,6 +1313,8 @@ void drawDisplay() {
                 }
             }
             lastTimeStr = currentTimeStr;
+            // 整屏/切换后重建顶部 FPS 区(有数据才显示,歌词模式已隐藏)
+            drawClockFpsArea();
         }
     } else if (currentPage == PAGE_INFO) {
         tft.fillScreen(TFT_BLACK);
@@ -1331,8 +1322,6 @@ void drawDisplay() {
         drawTaskbar();
     } else if (currentPage == PAGE_WEATHER) {
         drawWeatherPage();
-    } else if (currentPage == PAGE_PC_CONTROL) {
-        drawPcControlPage();
     } else if (currentPage == PAGE_CALENDAR) {
         drawCalendarPage();
     } else if (currentPage == PAGE_TIMER) {
@@ -1343,8 +1332,6 @@ void drawDisplay() {
         drawPcLayoutPage();
     } else if (currentPage == PAGE_TASK_MANAGER) {
         drawTaskManagerPage();
-    } else if (currentPage == PAGE_WORLD_TIME) {
-        drawWorldTimePage();
     }
 }
 
@@ -1372,9 +1359,12 @@ void applyDesktopLyricPacket(const String& data) {
         int nIdx = fullText.indexOf('\n');
         if (nIdx != -1) { currentLyric = fullText.substring(0, nIdx); currentTranslation = fullText.substring(nIdx+1); }
         else { currentLyric = fullText; currentTranslation = ""; }
-        lyricSungBytes = constrain(sungBytes, 0, (int)currentLyric.length());
         bool wasActive = lyricActive;
         lyricActive = (currentLyric.length() > 0);
+        bool lineChanged = !(wasActive && lyricActive && previousLyric == currentLyric
+                             && previousTranslation == currentTranslation);
+        // 已唱字节数以电脑版按歌词时间轴发送的值为准。
+        lyricSungBytes = constrain(sungBytes, 0, (int)currentLyric.length());
         lastLyricTime = millis();
         lastInteractionMillis = millis();
         if (lyricActive && screenHidden) {
@@ -1382,15 +1372,10 @@ void applyDesktopLyricPacket(const String& data) {
             digitalWrite(TFT_BL, HIGH);
         }
         if (currentPage == PAGE_MUSIC_TIME) {
-            // 同一句歌词只推进高亮时局部重绘，避免整屏闪烁。
-            if (wasActive && lyricActive && previousLyric == currentLyric
-                && previousTranslation == currentTranslation) {
-                drawLyricArea();
-                drawMusicProgress();
-                drawMusicControls();
-            } else {
-                drawDisplay();
-            }
+            // 同一句歌词只推进高亮:背景灰字不重画,仅叠画新唱单字。
+            // 进度条由 loop 的 500ms 节流负责,控制按钮仅在整句/整屏切换时重绘。
+            if (!lineChanged) advanceLyricSung();
+            else drawDisplay();
         }
     }
 }
@@ -1444,8 +1429,6 @@ String buildScreenPreviewText() {
                  + "\n湿度: " + currentWeather.humidity
                  + "\n风速: " + currentWeather.windSpeed
                  + "\n风向: " + currentWeather.windDir;
-        case PAGE_PC_CONTROL:
-            return "电脑控制\n播放/暂停  最小化  最大化\n关闭  重启  关机";
         case PAGE_CALENDAR:
             return String("日历\n日期: ") + currentDateStr + "\n时间: " + currentTimeStr;
         case PAGE_TIMER:
@@ -1461,18 +1444,9 @@ String buildScreenPreviewText() {
         case PAGE_PC_LAYOUT:
             return "电脑窗口布局（仅窗口方框）\n窗口数量: " + String(pcWindowCount);
         case PAGE_TASK_MANAGER:
-            return "任务管理器\n运行窗口: " + String(pcWindowCount);
-        case PAGE_WORLD_TIME: {
-            String text = "世界时间";
-            time_t utcNow = time(nullptr);
-            for (int i = 0; i < 6; ++i) {
-                text += "\n";
-                text += WORLD_CLOCK_ROWS[i].name;
-                text += " ";
-                text += desktopTimeSynced ? formatWorldTime(utcNow, WORLD_CLOCK_ROWS[i].utcOffsetHours) : "--:--:--";
-            }
-            return text;
-        }
+            return "任务管理器\n运行窗口: " + String(pcWindowCount)
+                 + "\n内存: " + String(pcMemoryUsedMB) + "/" + String(pcMemoryTotalMB) + " MB (" + String(pcMemoryUsage, 1) + "%)"
+                 + "\nGPU: " + String(pcGpuUsage, 1) + "%";
         default:
             return "未知页面: " + String(currentPage);
     }
@@ -1652,6 +1626,11 @@ void handleDesktopCommand(const String& line) {
                 pcGpuPowerWattValues[pcGpuCount] = gpu["powerWatts"] | -1.0f;
                 ++pcGpuCount;
             }
+            if (pcGpuCount == 0) {
+                // 未能枚举显卡明细时退回主显卡汇总字段，保证显存容量仍有显示。
+                pcGpuMemoryMBs[0] = doc["gpuMemoryMB"] | 0;
+                pcGpuDedicatedUsedMBs[0] = doc["gpuMemoryUsedMB"] | 0;
+            }
         }
         JsonArray windows = doc["windows"].as<JsonArray>();
         int nextMouseX = constrain(doc["mouseX"] | -1, -1, SCREEN_WIDTH - 1);
@@ -1712,6 +1691,10 @@ void handleDesktopCommand(const String& line) {
         if (!pauseCpu) {
             for (int i = 0; i < 35; ++i) pcCpuHistory[i] = pcCpuHistory[i + 1];
             pcCpuHistory[35] = pcCpuUsage;
+        }
+        if (!pauseMemory) {
+            for (int i = 0; i < 35; ++i) pcMemoryHistory[i] = pcMemoryHistory[i + 1];
+            pcMemoryHistory[35] = pcMemoryUsage;
         }
         if (!pauseGpu) {
             for (int i = 0; i < 35; ++i) pcGpuHistory[i] = pcGpuHistory[i + 1];
@@ -1781,10 +1764,16 @@ void loop() {
         if (!lyricActive) updateTimeFromSystemClock();
         if (currentPage == PAGE_MUSIC_TIME && !lyricActive) {
             drawDisplay();
-        } else if (currentPage == PAGE_WORLD_TIME && !screenHidden) {
-            refreshWorldTimePage();
         }
         lastTimeUpdate = millis();
+    }
+
+    // 时间页顶部 FPS 区独立刷新:仅重绘该小区域,不触发整屏/时间重绘。
+    // 有 FPS 数据(pcFps >= 0)才画;收到歌词(lyricActive)或熄屏时自动停画隐藏。
+    if (currentPage == PAGE_MUSIC_TIME && !lyricActive && !screenHidden
+        && pcFps >= 0 && millis() - lastClockFpsDraw >= 500) {
+        drawClockFpsArea();
+        lastClockFpsDraw = millis();
     }
 
     if (currentPage == PAGE_INFO && millis() - lastInfoUpdate >= 1000) {
@@ -1802,7 +1791,8 @@ void loop() {
     // Keep PC telemetry and FPS views in step with the desktop sender's 50 ms cadence.
     unsigned long pcRefreshInterval = 50UL;
     bool pcPageNeedsRefresh = currentPage == PAGE_PC_STATUS ? pcStatusDirty
-        : ((currentPage == PAGE_PC_LAYOUT || currentPage == PAGE_TASK_MANAGER) && pcWindowLayoutDirty);
+        : (currentPage == PAGE_PC_LAYOUT ? pcWindowLayoutDirty
+        : (currentPage == PAGE_TASK_MANAGER && (pcWindowLayoutDirty || pcStatusDirty)));
     if (pcPageNeedsRefresh && !screenHidden && millis() - lastPcStatusDraw >= pcRefreshInterval) {
         if (currentPage == PAGE_PC_LAYOUT) {
             drawPcLayoutPage();
@@ -1810,8 +1800,15 @@ void loop() {
             pcMouseDirty = false;
             pcPreviousMouseX = pcMouseX; pcPreviousMouseY = pcMouseY;
         } else if (currentPage == PAGE_TASK_MANAGER) {
-            drawTaskManagerPage();
-            pcWindowLayoutDirty = false;
+            // 窗口布局变化才整页重绘；仅有遥测更新时只刷新顶部统计区（500ms 节流）。
+            if (pcWindowLayoutDirty) {
+                drawTaskManagerPage();
+                pcWindowLayoutDirty = false;
+                lastTaskManagerStatsDraw = millis();
+            } else if (millis() - lastTaskManagerStatsDraw >= 500UL) {
+                refreshTaskManagerStats();
+                lastTaskManagerStatsDraw = millis();
+            }
         } else {
             refreshPcStatusPage();
         }
@@ -1855,13 +1852,6 @@ void loop() {
 
     if (timerRunning && millis() - lastTimerMemorySave >= 30000UL) {
         saveTimerMemory();
-    }
-
-    if (currentPage == PAGE_PC_CONTROL && pendingPcControlAction.length()
-        && millis() >= pendingPcControlUntil) {
-        pendingPcControlAction = "";
-        pendingPcControlUntil = 0;
-        drawPcControlPage();
     }
 
     if (currentPage == PAGE_WEATHER && currentWeather.isValid) {
@@ -1973,8 +1963,6 @@ void loop() {
                     drawDisplay();
                 } else if (currentPage == PAGE_PC_STATUS && abs(finalDx) < 200 && abs(finalDy) < 200) {
                     handlePcStatusTap(screenX, screenY);
-                } else if (currentPage == PAGE_PC_CONTROL && abs(finalDx) < 200 && abs(finalDy) < 200) {
-                    handlePcControlTap(screenX, screenY);
                 } else if (abs(finalDx) < 200 && abs(finalDy) < 200 && handleMusicControlTap(finalX, finalY)) {
                     // 音乐控制点击已处理
                 } else if (finalDx > SWIPE_MIN_X) { // 向右划：上一页
